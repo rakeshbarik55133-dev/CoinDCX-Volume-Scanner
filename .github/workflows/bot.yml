@@ -29,6 +29,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirement.txt
 
+ 
       - name: Verify scanner endpoint
         run: |
           git rev-parse HEAD
@@ -39,6 +40,8 @@ jobs:
           assert main.COINDCX_MARKETS_URL == "https://api.coindcx.com/exchange/v1/markets_details"
           PY
 
+
+ 
       - name: Run CoinDCX scanner
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
