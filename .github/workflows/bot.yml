@@ -1,0 +1,46 @@
+name: CoinDCX Telegram Scanner
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Restore alert state
+        uses: actions/cache@v4
+        with:
+          path: .alert_state.json
+          key: alert-state-${{ github.run_id }}
+          restore-keys: |
+            alert-state-
+
+      - name: Install dependencies
+        run: pip install -r requirement.txt
+
+      - name: Verify scanner endpoint
+        run: |
+          git rev-parse HEAD
+          python - <<'PY'
+          import main
+
+          print(main.COINDCX_MARKETS_URL)
+          assert main.COINDCX_MARKETS_URL.endswith("/markets_details")
+          PY
+
+      - name: Run CoinDCX scanner
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: python main.py
