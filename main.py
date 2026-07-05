@@ -18,7 +18,7 @@ from typing import Any, Iterable
 
 import requests
 
-COINDCX_MARKETS_URL = "https://api.coindcx.com/exchange/v1/market_details"
+COINDCX_MARKETS_URL = https://api.coindcx.com/exchange/v1/markets_details 
 COINDCX_CANDLES_URL = "https://public.coindcx.com/market_data/candles/"
 TELEGRAM_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
