@@ -1,0 +1,32 @@
+name: FYERS NSE Futures Volume Scanner
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 14
+    env:
+      FYERS_APP_ID: ${{ secrets.FYERS_APP_ID }}
+      FYERS_SECRET_KEY: ${{ secrets.FYERS_SECRET_KEY }}
+      FYERS_REDIRECT_URI: ${{ secrets.FYERS_REDIRECT_URI }}
+      FYERS_ACCESS_TOKEN: ${{ secrets.FYERS_ACCESS_TOKEN }}
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      CHAT_ID: ${{ secrets.CHAT_ID }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scanner
+        run: python main.py

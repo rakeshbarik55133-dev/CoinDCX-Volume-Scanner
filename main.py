@@ -1,39 +1,49 @@
-"""CoinDCX USDT volume breakout Telegram scanner.
+"""FYERS NSE Futures 15-minute volume breakout Telegram scanner.
 
-Scans CoinDCX USDT markets on the 15-minute timeframe, looking for a quiet
-("dead volume") window followed by a relative volume spike and a confirmed
-price breakout or breakdown. Alerts are sent to Telegram and de-duplicated per
-pair, direction, and candle close time.
+The bot scans FYERS NSE Futures instruments, checks the latest closed
+15-minute candle against the previous 20 closed candles, and sends de-duplicated
+Telegram alerts for high-volume breakouts/breakdowns.
 """
 
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import os
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from io import StringIO
 from pathlib import Path
 from typing import Any, Iterable
 
 import requests
 
-COINDCX_MARKETS_URL = "https://api.coindcx.com/exchange/v1/markets_details"
-COINDCX_CANDLES_URL = "https://public.coindcx.com/market_data/candles/"
+FYERS_NSE_FO_SYMBOL_MASTER_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
 TELEGRAM_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
-INTERVAL = "15m"
-CANDLE_LIMIT = 80
-REQUEST_TIMEOUT = 20
+TIMEFRAME_MINUTES = 15
+FYERS_RESOLUTION = str(TIMEFRAME_MINUTES)
+LOOKBACK_CANDLES = int(os.getenv("LOOKBACK_CANDLES", "20"))
+VOLUME_MULTIPLIER = float(os.getenv("VOLUME_MULTIPLIER", "3"))
+RISK_REWARD = float(os.getenv("RISK_REWARD", "2"))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
+SCAN_SLEEP_SECONDS = float(os.getenv("SCAN_SLEEP_SECONDS", "0.15"))
+MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "0"))
 STATE_FILE = Path(os.getenv("STATE_FILE", ".alert_state.json"))
 
-DEAD_VOLUME_LOOKBACK = int(os.getenv("DEAD_VOLUME_LOOKBACK", "8"))
-BREAKOUT_LOOKBACK = int(os.getenv("BREAKOUT_LOOKBACK", "12"))
-DEAD_VOLUME_RATIO = float(os.getenv("DEAD_VOLUME_RATIO", "0.65"))
-SPIKE_MULTIPLIER = float(os.getenv("SPIKE_MULTIPLIER", "2.5"))
-MIN_QUOTE_VOLUME = float(os.getenv("MIN_QUOTE_VOLUME", "1000"))
-SCAN_SLEEP_SECONDS = float(os.getenv("SCAN_SLEEP_SECONDS", "0.25"))
-MAX_PAIRS = int(os.getenv("MAX_PAIRS", "0"))
+# Need at least 20 previous closed candles plus the current/latest closed candle.
+CANDLE_DAYS_BACK = int(os.getenv("CANDLE_DAYS_BACK", "10"))
+
+REQUIRED_ENV_VARS = (
+    "FYERS_APP_ID",
+    "FYERS_SECRET_KEY",
+    "FYERS_REDIRECT_URI",
+    "FYERS_ACCESS_TOKEN",
+    "BOT_TOKEN",
+    "CHAT_ID",
+)
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -44,38 +54,37 @@ LOGGER = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class Candle:
+    timestamp: int
     open: float
     high: float
     low: float
     close: float
     volume: float
-    timestamp: int
-
-    @property
-    def quote_volume(self) -> float:
-        return self.close * self.volume
 
 
 @dataclass(frozen=True)
 class Signal:
-    pair: str
+    symbol: str
     direction: str
     candle: Candle
-    dead_average: float
-    previous_average: float
-    breakout_level: float
-    spike_ratio: float
+    average_volume: float
+    previous_high: float
+    previous_low: float
+    signal_strength: float
+    stop_loss: float
+    target: float
 
     @property
     def alert_key(self) -> str:
-        return f"{self.pair}:{self.direction}:{self.candle.timestamp}"
+        return f"{self.symbol}:{self.direction}:{self.candle.timestamp}"
 
 
-def as_float(value: Any) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return 0.0
+def get_required_env() -> dict[str, str]:
+    values = {name: os.getenv(name, "").strip() for name in REQUIRED_ENV_VARS}
+    missing = [name for name, value in values.items() if not value]
+    if missing:
+        raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
+    return values
 
 
 def load_state() -> set[str]:
@@ -96,48 +105,11 @@ def save_state(sent_alerts: set[str]) -> None:
     )
 
 
-def get_usdt_pairs(session: requests.Session) -> list[str]:
-    response = session.get(COINDCX_MARKETS_URL, timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
-    markets = response.json()
-
-    pairs: list[str] = []
-    for market in markets:
-        if not market.get("coindcx_name"):
-            continue
-        if market.get("base_currency_short_name") != "USDT":
-            continue
-        if market.get("status", "active").lower() not in {"active", "online"}:
-            continue
-        pairs.append(str(market["coindcx_name"]))
-
-    unique_pairs = sorted(set(pairs))
-    if MAX_PAIRS > 0:
-        return unique_pairs[:MAX_PAIRS]
-    return unique_pairs
-
-
-def normalize_candle(raw: dict[str, Any]) -> Candle:
-    return Candle(
-        open=as_float(raw.get("open")),
-        high=as_float(raw.get("high")),
-        low=as_float(raw.get("low")),
-        close=as_float(raw.get("close")),
-        volume=as_float(raw.get("volume")),
-        timestamp=int(as_float(raw.get("time") or raw.get("timestamp"))),
-    )
-
-
-def get_candles(session: requests.Session, pair: str) -> list[Candle]:
-    response = session.get(
-        COINDCX_CANDLES_URL,
-        params={"pair": pair, "interval": INTERVAL, "limit": CANDLE_LIMIT},
-        timeout=REQUEST_TIMEOUT,
-    )
-    response.raise_for_status()
-    candles = [normalize_candle(item) for item in response.json()]
-    valid_candles = (candle for candle in candles if candle.timestamp)
-    return sorted(valid_candles, key=lambda item: item.timestamp)
+def as_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def average(values: Iterable[float]) -> float:
@@ -145,75 +117,122 @@ def average(values: Iterable[float]) -> float:
     return sum(numbers) / len(numbers) if numbers else 0.0
 
 
-def detect_signal(pair: str, candles: list[Candle]) -> Signal | None:
-    minimum_needed = DEAD_VOLUME_LOOKBACK + BREAKOUT_LOOKBACK + 2
-    if len(candles) < minimum_needed:
-        return None
+def get_nse_futures_symbols(session: requests.Session) -> list[str]:
+    """Return all FYERS NSE futures symbols from the FYERS symbol master."""
+    response = session.get(FYERS_NSE_FO_SYMBOL_MASTER_URL, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
 
-    closed_candles = candles[:-1]
-    spike_candle = closed_candles[-1]
-    dead_window = closed_candles[-(DEAD_VOLUME_LOOKBACK + 1) : -1]
-    history = closed_candles[: -(DEAD_VOLUME_LOOKBACK + 1)]
-    breakout_window = closed_candles[-(BREAKOUT_LOOKBACK + 1) : -1]
+    symbols: set[str] = set()
+    reader = csv.reader(StringIO(response.text))
+    for row in reader:
+        fyers_symbols = [item.strip() for item in row if item.strip().startswith("NSE:")]
+        for symbol in fyers_symbols:
+            if "FUT" in symbol.upper():
+                symbols.add(symbol)
 
-    if len(dead_window) < DEAD_VOLUME_LOOKBACK or len(history) < BREAKOUT_LOOKBACK:
-        return None
+    ordered = sorted(symbols)
+    if MAX_SYMBOLS > 0:
+        return ordered[:MAX_SYMBOLS]
+    return ordered
 
-    dead_average = average(candle.volume for candle in dead_window)
-    previous_average = average(candle.volume for candle in history[-BREAKOUT_LOOKBACK:])
-    if previous_average <= 0 or dead_average <= 0:
-        return None
 
-    is_dead_volume = dead_average <= previous_average * DEAD_VOLUME_RATIO
-    is_spike = spike_candle.volume >= dead_average * SPIKE_MULTIPLIER
-    has_minimum_liquidity = spike_candle.quote_volume >= MIN_QUOTE_VOLUME
-    if not (is_dead_volume and is_spike and has_minimum_liquidity):
-        return None
+def get_fyers_client(app_id: str, access_token: str) -> Any:
+    from fyers_apiv3 import fyersModel
 
-    prior_high = max(candle.high for candle in breakout_window)
-    prior_low = min(candle.low for candle in breakout_window)
+    return fyersModel.FyersModel(client_id=app_id, token=access_token, is_async=False, log_path="")
 
-    if spike_candle.close > prior_high:
-        return Signal(
-            pair=pair,
-            direction="BREAKOUT",
-            candle=spike_candle,
-            dead_average=dead_average,
-            previous_average=previous_average,
-            breakout_level=prior_high,
-            spike_ratio=spike_candle.volume / dead_average,
+
+def get_candles(fyers: Any, symbol: str) -> list[Candle]:
+    today = datetime.now(UTC).date()
+    payload = {
+        "symbol": symbol,
+        "resolution": FYERS_RESOLUTION,
+        "date_format": "1",
+        "range_from": (today - timedelta(days=CANDLE_DAYS_BACK)).isoformat(),
+        "range_to": today.isoformat(),
+        "cont_flag": "1",
+    }
+    response = fyers.history(data=payload)
+    if not isinstance(response, dict) or response.get("s") != "ok":
+        raise RuntimeError(f"FYERS history failed for {symbol}: {response}")
+
+    candles = []
+    for raw in response.get("candles", []):
+        if len(raw) < 6:
+            continue
+        candles.append(
+            Candle(
+                timestamp=int(as_float(raw[0])),
+                open=as_float(raw[1]),
+                high=as_float(raw[2]),
+                low=as_float(raw[3]),
+                close=as_float(raw[4]),
+                volume=as_float(raw[5]),
+            )
         )
-    if spike_candle.close < prior_low:
-        return Signal(
-            pair=pair,
-            direction="BREAKDOWN",
-            candle=spike_candle,
-            dead_average=dead_average,
-            previous_average=previous_average,
-            breakout_level=prior_low,
-            spike_ratio=spike_candle.volume / dead_average,
-        )
+    return sorted(candles, key=lambda item: item.timestamp)
+
+
+def latest_closed_candles(candles: list[Candle]) -> list[Candle]:
+    """Drop an in-progress candle when FYERS returns one for the current interval."""
+    if not candles:
+        return []
+    now = int(time.time())
+    interval_seconds = TIMEFRAME_MINUTES * 60
+    if candles[-1].timestamp + interval_seconds > now:
+        return candles[:-1]
+    return candles
+
+
+def detect_signal(symbol: str, candles: list[Candle]) -> Signal | None:
+    closed = latest_closed_candles(candles)
+    if len(closed) < LOOKBACK_CANDLES + 1:
+        return None
+
+    current = closed[-1]
+    previous = closed[-(LOOKBACK_CANDLES + 1) : -1]
+    avg_volume = average(candle.volume for candle in previous)
+    if avg_volume <= 0 or current.volume < avg_volume * VOLUME_MULTIPLIER:
+        return None
+
+    previous_high = max(candle.high for candle in previous)
+    previous_low = min(candle.low for candle in previous)
+    strength = current.volume / avg_volume
+
+    if current.close > current.open and current.close > previous_high:
+        stop_loss = min(current.low, previous_low)
+        risk = current.close - stop_loss
+        target = current.close + risk * RISK_REWARD
+        return Signal(symbol, "BUY", current, avg_volume, previous_high, previous_low, strength, stop_loss, target)
+
+    if current.close < current.open and current.close < previous_low:
+        stop_loss = max(current.high, previous_high)
+        risk = stop_loss - current.close
+        target = current.close - risk * RISK_REWARD
+        return Signal(symbol, "SELL", current, avg_volume, previous_high, previous_low, strength, stop_loss, target)
+
     return None
 
 
 def format_alert(signal: Signal) -> str:
-    emoji = "🚀" if signal.direction == "BREAKOUT" else "🔻"
+    candle_time = datetime.fromtimestamp(signal.candle.timestamp, UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+    emoji = "🟢" if signal.direction == "BUY" else "🔴"
     return (
-        f"{emoji} CoinDCX 15m {signal.direction}\n"
-        f"Pair: {signal.pair}\n"
-        f"Close: {signal.candle.close:g}\n"
-        f"Level: {signal.breakout_level:g}\n"
-        f"Volume spike: {signal.spike_ratio:.2f}x dead-volume average\n"
-        f"Dead avg volume: {signal.dead_average:.4f}\n"
-        f"Previous avg volume: {signal.previous_average:.4f}\n"
-        f"Quote volume: {signal.candle.quote_volume:.2f} USDT\n"
-        f"Candle time: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(signal.candle.timestamp / 1000))}"
+        f"{emoji} FYERS NSE Futures 15m {signal.direction}\n"
+        f"Symbol: {signal.symbol}\n"
+        f"Entry: {signal.candle.close:.2f}\n"
+        f"Stop Loss: {signal.stop_loss:.2f}\n"
+        f"Target: {signal.target:.2f}\n"
+        f"Signal Strength: {signal.signal_strength:.2f}x volume\n"
+        f"Current Volume: {signal.candle.volume:.0f}\n"
+        f"20-Candle Avg Volume: {signal.average_volume:.0f}\n"
+        f"20-Candle High: {signal.previous_high:.2f}\n"
+        f"20-Candle Low: {signal.previous_low:.2f}\n"
+        f"Candle Time: {candle_time}"
     )
 
 
-def send_telegram_alert(
-    session: requests.Session, token: str, chat_id: str, message: str
-) -> None:
+def send_telegram_alert(session: requests.Session, token: str, chat_id: str, message: str) -> None:
     response = session.post(
         TELEGRAM_URL.format(token=token),
         json={"chat_id": chat_id, "text": message, "disable_web_page_preview": True},
@@ -223,32 +242,30 @@ def send_telegram_alert(
 
 
 def run_scan() -> int:
-    bot_token = os.getenv("BOT_TOKEN")
-    chat_id = os.getenv("CHAT_ID")
-    if not bot_token or not chat_id:
-        raise RuntimeError("BOT_TOKEN and CHAT_ID environment variables are required")
-
+    env = get_required_env()
     sent_alerts = load_state()
     alerts_sent = 0
 
+    fyers = get_fyers_client(env["FYERS_APP_ID"], env["FYERS_ACCESS_TOKEN"])
     with requests.Session() as session:
-        pairs = get_usdt_pairs(session)
-        LOGGER.info("Scanning %s CoinDCX USDT pairs on %s", len(pairs), INTERVAL)
-        for pair in pairs:
+        symbols = get_nse_futures_symbols(session)
+        LOGGER.info("Scanning %s FYERS NSE futures symbols on %s-minute candles", len(symbols), TIMEFRAME_MINUTES)
+        for symbol in symbols:
             try:
-                signal = detect_signal(pair, get_candles(session, pair))
-            except requests.RequestException as exc:
-                LOGGER.warning("Skipping %s after API error: %s", pair, exc)
+                signal = detect_signal(symbol, get_candles(fyers, symbol))
+            except Exception as exc:  # noqa: BLE001 - continue scanning after per-symbol API/data errors.
+                LOGGER.warning("Skipping %s after data error: %s", symbol, exc)
+                time.sleep(SCAN_SLEEP_SECONDS)
                 continue
 
             if not signal or signal.alert_key in sent_alerts:
                 time.sleep(SCAN_SLEEP_SECONDS)
                 continue
 
-            send_telegram_alert(session, bot_token, chat_id, format_alert(signal))
+            send_telegram_alert(session, env["BOT_TOKEN"], env["CHAT_ID"], format_alert(signal))
             sent_alerts.add(signal.alert_key)
             alerts_sent += 1
-            LOGGER.info("Sent %s alert for %s", signal.direction, pair)
+            LOGGER.info("Sent %s alert for %s", signal.direction, symbol)
             time.sleep(SCAN_SLEEP_SECONDS)
 
     save_state(sent_alerts)
