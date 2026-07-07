@@ -1,15 +1,16 @@
 """CoinDCX USDT volume breakout Telegram scanner.
 
 Scans CoinDCX USDT markets on the 15-minute timeframe, looking for a quiet
-("dead volume") window followed by a relative volume spike and a confirmed
-price breakout or breakdown. Alerts are sent to Telegram and de-duplicated per
-pair, direction, and candle close time.
+("dead volume") window followed by a relative volume spike and a price
+breakout or breakdown on the latest closed candle. Alerts are sent to Telegram
+and de-duplicated per pair, direction, and candle close time.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -29,8 +30,6 @@ STATE_FILE = Path(os.getenv("STATE_FILE", ".alert_state.json"))
 
 DEAD_VOLUME_LOOKBACK = int(os.getenv("DEAD_VOLUME_LOOKBACK", "8"))
 BREAKOUT_LOOKBACK = int(os.getenv("BREAKOUT_LOOKBACK", "12"))
-DEAD_VOLUME_RATIO = float(os.getenv("DEAD_VOLUME_RATIO", "0.65"))
-SPIKE_MULTIPLIER = float(os.getenv("SPIKE_MULTIPLIER", "2.5"))
 MIN_QUOTE_VOLUME = float(os.getenv("MIN_QUOTE_VOLUME", "1000"))
 SCAN_SLEEP_SECONDS = float(os.getenv("SCAN_SLEEP_SECONDS", "0.25"))
 MAX_PAIRS = int(os.getenv("MAX_PAIRS", "0"))
@@ -39,10 +38,11 @@ DEAD_VOLUME_RATIO = float(os.getenv("DEAD_VOLUME_RATIO", "0.72"))
 SPIKE_MULTIPLIER = float(os.getenv("SPIKE_MULTIPLIER", "2.2"))
 MAX_QUIET_RANGE_PCT = float(os.getenv("MAX_QUIET_RANGE_PCT", "3.0"))
 MIN_BREAK_PCT = float(os.getenv("MIN_BREAK_PCT", "0.18"))
+ENTRY_PROXIMITY_PCT = float(os.getenv("ENTRY_PROXIMITY_PCT", "0.12"))
 MIN_BODY_PCT = float(os.getenv("MIN_BODY_PCT", "0.35"))
 MIN_CLOSE_LOCATION = float(os.getenv("MIN_CLOSE_LOCATION", "0.62"))
 MAX_EXTENSION_FROM_RANGE_PCT = float(os.getenv("MAX_EXTENSION_FROM_RANGE_PCT", "9.0"))
-CONFIRMATION_WINDOW_CANDLES = int(os.getenv("CONFIRMATION_WINDOW_CANDLES", "5"))
+DAILY_TOP_PER_DIRECTION = int(os.getenv("DAILY_TOP_PER_DIRECTION", "2"))
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -81,6 +81,32 @@ class Signal:
     @property
     def alert_key(self) -> str:
         return f"{self.pair}:{self.direction}:{self.confirmation_candle.timestamp}"
+
+    @property
+    def daily_direction(self) -> str:
+        return "UP" if self.direction == "BREAKOUT" else "DOWN"
+
+    @property
+    def quiet_quality(self) -> float:
+        if MAX_QUIET_RANGE_PCT <= 0:
+            return 0.0
+        return max(0.0, (MAX_QUIET_RANGE_PCT - self.quiet_range_pct) / MAX_QUIET_RANGE_PCT)
+
+    @property
+    def rank_score(self) -> float:
+        quote_volume_score = math.log10(max(self.candle.quote_volume, 1.0))
+        return (
+            self.spike_ratio * 35
+            + self.break_pct * 25
+            + quote_volume_score * 10
+            + self.quiet_quality * 30
+        )
+
+    @property
+    def entry_timing(self) -> str:
+        if self.break_pct >= MIN_BREAK_PCT:
+            return "close breakout"
+        return "early range-edge ignition"
 
 
 def as_float(value: Any) -> float:
@@ -157,59 +183,14 @@ def average(values: Iterable[float]) -> float:
     return sum(numbers) / len(numbers) if numbers else 0.0
 
 
-def confirms_trigger_break(signal: Signal, confirmation_candle: Candle) -> bool:
-    if signal.direction == "BREAKOUT":
-        return confirmation_candle.close > signal.candle.high
-    return confirmation_candle.close < signal.candle.low
-
-
-def with_confirmation(signal: Signal, confirmation_candle: Candle) -> Signal:
-    return Signal(
-        pair=signal.pair,
-        direction=signal.direction,
-        candle=signal.candle,
-        dead_average=signal.dead_average,
-        previous_average=signal.previous_average,
-        breakout_level=signal.breakout_level,
-        spike_ratio=signal.spike_ratio,
-        quiet_range_pct=signal.quiet_range_pct,
-        break_pct=signal.break_pct,
-        confirmation_candle=confirmation_candle,
-    )
-
-
 def detect_signal(pair: str, candles: list[Candle]) -> Signal | None:
-    minimum_needed = max(DEAD_VOLUME_LOOKBACK, BREAKOUT_LOOKBACK) + BREAKOUT_LOOKBACK + 2
+    minimum_needed = max(DEAD_VOLUME_LOOKBACK, BREAKOUT_LOOKBACK) + BREAKOUT_LOOKBACK + 1
     if len(candles) < minimum_needed:
         return None
 
     closed_candles = candles[:-1]
     latest_closed_index = len(closed_candles) - 1
-    candidate_index = 0
-    while candidate_index < latest_closed_index:
-        signal = build_signal(pair, closed_candles, candidate_index)
-        if not signal:
-            candidate_index += 1
-            continue
-
-        window_end_index = min(candidate_index + CONFIRMATION_WINDOW_CANDLES, latest_closed_index)
-        confirmation_index = None
-        for watch_index in range(candidate_index + 1, window_end_index + 1):
-            if confirms_trigger_break(signal, closed_candles[watch_index]):
-                confirmation_index = watch_index
-                break
-
-        if confirmation_index is None:
-            if latest_closed_index <= candidate_index + CONFIRMATION_WINDOW_CANDLES:
-                return None
-            candidate_index += CONFIRMATION_WINDOW_CANDLES + 1
-            continue
-
-        if confirmation_index == latest_closed_index:
-            return with_confirmation(signal, closed_candles[confirmation_index])
-
-        candidate_index = confirmation_index + 1
-    return None
+    return build_signal(pair, closed_candles, latest_closed_index)
 
 
 def percent_change(current: float, reference: float) -> float:
@@ -278,9 +259,17 @@ def build_signal(pair: str, closed_candles: list[Candle], trigger_index: int) ->
     upper_break_pct = percent_change(spike_candle.close, quiet_high)
     lower_break_pct = percent_change(quiet_low, spike_candle.close)
     max_extension = MAX_EXTENSION_FROM_RANGE_PCT
+    upper_range_edge_ignition = (
+        spike_candle.high >= quiet_high
+        and percent_change(spike_candle.close, quiet_high) >= -ENTRY_PROXIMITY_PCT
+    )
+    lower_range_edge_ignition = (
+        spike_candle.low <= quiet_low
+        and percent_change(quiet_low, spike_candle.close) >= -ENTRY_PROXIMITY_PCT
+    )
 
     if (
-        upper_break_pct >= MIN_BREAK_PCT
+        (upper_break_pct >= MIN_BREAK_PCT or upper_range_edge_ignition)
         and upper_break_pct <= max_extension
         and is_real_breakout_candle(spike_candle)
         and close_location(spike_candle) >= MIN_CLOSE_LOCATION
@@ -294,11 +283,11 @@ def build_signal(pair: str, closed_candles: list[Candle], trigger_index: int) ->
             breakout_level=quiet_high,
             spike_ratio=spike_candle.volume / dead_average,
             quiet_range_pct=quiet_range_pct,
-            break_pct=upper_break_pct,
+            break_pct=max(upper_break_pct, 0.0),
             confirmation_candle=spike_candle,
         )
     if (
-        lower_break_pct >= MIN_BREAK_PCT
+        (lower_break_pct >= MIN_BREAK_PCT or lower_range_edge_ignition)
         and lower_break_pct <= max_extension
         and is_real_breakdown_candle(spike_candle)
         and close_location(spike_candle) <= (1 - MIN_CLOSE_LOCATION)
@@ -312,26 +301,77 @@ def build_signal(pair: str, closed_candles: list[Candle], trigger_index: int) ->
             breakout_level=quiet_low,
             spike_ratio=spike_candle.volume / dead_average,
             quiet_range_pct=quiet_range_pct,
-            break_pct=lower_break_pct,
+            break_pct=max(lower_break_pct, 0.0),
             confirmation_candle=spike_candle,
         )
     return None
 
 
-def format_alert(signal: Signal) -> str:
+def current_day_key() -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def daily_sent_key(day_key: str, direction: str, rank: int) -> str:
+    return f"daily:{day_key}:{direction}:{rank}"
+
+
+def sent_daily_count(sent_alerts: set[str], day_key: str, direction: str) -> int:
+    prefix = f"daily:{day_key}:{direction}:"
+    return sum(1 for item in sent_alerts if item.startswith(prefix))
+
+
+def rank_signals(signals: list[Signal]) -> list[Signal]:
+    return sorted(
+        signals,
+        key=lambda signal: (
+            signal.rank_score,
+            signal.spike_ratio,
+            signal.break_pct,
+            signal.candle.quote_volume,
+            -signal.quiet_range_pct,
+        ),
+        reverse=True,
+    )
+
+
+def select_daily_top_signals(signals: list[Signal], sent_alerts: set[str], day_key: str) -> list[tuple[int, Signal]]:
+    selected: list[tuple[int, Signal]] = []
+    for direction in ("UP", "DOWN"):
+        already_sent = sent_daily_count(sent_alerts, day_key, direction)
+        remaining_slots = max(DAILY_TOP_PER_DIRECTION - already_sent, 0)
+        if remaining_slots <= 0:
+            continue
+
+        direction_signals = [
+            signal
+            for signal in signals
+            if signal.daily_direction == direction and signal.alert_key not in sent_alerts
+        ]
+        for offset, signal in enumerate(rank_signals(direction_signals)[:remaining_slots], start=1):
+            selected.append((already_sent + offset, signal))
+    return selected
+
+
+def format_alert(signal: Signal, rank: int, day_key: str) -> str:
     emoji = "🚀" if signal.direction == "BREAKOUT" else "🔻"
     return (
-        f"{emoji} CoinDCX 15m {signal.direction}\n"
+        f"{emoji} CoinDCX 15m daily #{rank} {signal.daily_direction} signal ({signal.direction})\n"
+        f"Ranking day: {day_key} UTC\n"
         f"Pair: {signal.pair}\n"
         f"Close: {signal.candle.close:g}\n"
         f"Level: {signal.breakout_level:g}\n"
         f"Volume spike: {signal.spike_ratio:.2f}x dead-volume average\n"
         f"Quiet range: {signal.quiet_range_pct:.2f}%\n"
         f"Break strength: {signal.break_pct:.2f}%\n"
+        f"Quiet quality: {signal.quiet_quality:.2%} (tighter quiet range ranks higher)\n"
+        f"Rank score: {signal.rank_score:.2f}\n"
+        f"Entry timing: {signal.entry_timing}\n"
+        f"Ranking formula: spike_ratio*35 + break_pct*25 + log10(quote_volume)*10 + quiet_quality*30\n"
         f"Dead avg volume: {signal.dead_average:.4f}\n"
         f"Previous avg volume: {signal.previous_average:.4f}\n"
         f"Quote volume: {signal.candle.quote_volume:.2f} USDT\n"
         f"Trigger candle time: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(signal.candle.timestamp / 1000))}\n"
+        f"Alert basis: latest closed 15m candle; no delayed 5-candle confirmation\n"
         f"Alert candle time: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(signal.confirmation_candle.timestamp / 1000))}"
     )
 
@@ -359,6 +399,7 @@ def run_scan() -> int:
     with requests.Session() as session:
         pairs = get_usdt_pairs(session)
         LOGGER.info("Scanning %s CoinDCX USDT pairs on %s", len(pairs), INTERVAL)
+        valid_signals: list[Signal] = []
         for pair in pairs:
             try:
                 signal = detect_signal(pair, get_candles(session, pair))
@@ -366,15 +407,17 @@ def run_scan() -> int:
                 LOGGER.warning("Skipping %s after API error: %s", pair, exc)
                 continue
 
-            if not signal or signal.alert_key in sent_alerts:
-                time.sleep(SCAN_SLEEP_SECONDS)
-                continue
-
-            send_telegram_alert(session, bot_token, chat_id, format_alert(signal))
-            sent_alerts.add(signal.alert_key)
-            alerts_sent += 1
-            LOGGER.info("Sent %s alert for %s", signal.direction, pair)
+            if signal:
+                valid_signals.append(signal)
             time.sleep(SCAN_SLEEP_SECONDS)
+
+        day_key = current_day_key()
+        for rank, signal in select_daily_top_signals(valid_signals, sent_alerts, day_key):
+            send_telegram_alert(session, bot_token, chat_id, format_alert(signal, rank, day_key))
+            sent_alerts.add(signal.alert_key)
+            sent_alerts.add(daily_sent_key(day_key, signal.daily_direction, rank))
+            alerts_sent += 1
+            LOGGER.info("Sent daily #%s %s alert for %s", rank, signal.daily_direction, signal.pair)
 
     save_state(sent_alerts)
     LOGGER.info("Scan complete; sent %s alert(s)", alerts_sent)
