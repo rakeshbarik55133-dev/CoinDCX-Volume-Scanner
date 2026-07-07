@@ -35,6 +35,15 @@ MIN_QUOTE_VOLUME = float(os.getenv("MIN_QUOTE_VOLUME", "1000"))
 SCAN_SLEEP_SECONDS = float(os.getenv("SCAN_SLEEP_SECONDS", "0.25"))
 MAX_PAIRS = int(os.getenv("MAX_PAIRS", "0"))
 
+TRIGGER_LOOKBACK = int(os.getenv("TRIGGER_LOOKBACK", "3"))
+DEAD_VOLUME_RATIO = float(os.getenv("DEAD_VOLUME_RATIO", "0.72"))
+SPIKE_MULTIPLIER = float(os.getenv("SPIKE_MULTIPLIER", "2.2"))
+MAX_QUIET_RANGE_PCT = float(os.getenv("MAX_QUIET_RANGE_PCT", "3.0"))
+MIN_BREAK_PCT = float(os.getenv("MIN_BREAK_PCT", "0.18"))
+MIN_BODY_PCT = float(os.getenv("MIN_BODY_PCT", "0.35"))
+MIN_CLOSE_LOCATION = float(os.getenv("MIN_CLOSE_LOCATION", "0.62"))
+MAX_EXTENSION_FROM_RANGE_PCT = float(os.getenv("MAX_EXTENSION_FROM_RANGE_PCT", "9.0"))
+
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s %(message)s",
@@ -65,6 +74,8 @@ class Signal:
     previous_average: float
     breakout_level: float
     spike_ratio: float
+    quiet_range_pct: float
+    break_pct: float
 
     @property
     def alert_key(self) -> str:
@@ -196,6 +207,124 @@ def detect_signal(pair: str, candles: list[Candle]) -> Signal | None:
     return None
 
 
+def percent_change(current: float, reference: float) -> float:
+    if reference <= 0:
+        return 0.0
+    return ((current - reference) / reference) * 100
+
+
+def candle_range(candle: Candle) -> float:
+    return max(candle.high - candle.low, 0.0)
+
+
+def body_ratio(candle: Candle) -> float:
+    price_range = candle_range(candle)
+    if price_range <= 0:
+        return 0.0
+    return abs(candle.close - candle.open) / price_range
+
+
+def close_location(candle: Candle) -> float:
+    price_range = candle_range(candle)
+    if price_range <= 0:
+        return 0.5
+    return (candle.close - candle.low) / price_range
+
+
+def is_real_breakout_candle(candle: Candle) -> bool:
+    return candle.close > candle.open and body_ratio(candle) >= MIN_BODY_PCT
+
+
+def is_real_breakdown_candle(candle: Candle) -> bool:
+    return candle.close < candle.open and body_ratio(candle) >= MIN_BODY_PCT
+
+
+def build_signal(pair: str, closed_candles: list[Candle], trigger_index: int) -> Signal | None:
+    spike_candle = closed_candles[trigger_index]
+    dead_start = trigger_index - DEAD_VOLUME_LOOKBACK
+    breakout_start = trigger_index - BREAKOUT_LOOKBACK
+    if dead_start < 0 or breakout_start < 0:
+        return None
+
+    dead_window = closed_candles[dead_start:trigger_index]
+    breakout_window = closed_candles[breakout_start:trigger_index]
+    history = closed_candles[:dead_start]
+    if len(dead_window) < DEAD_VOLUME_LOOKBACK or len(breakout_window) < BREAKOUT_LOOKBACK:
+        return None
+
+    dead_average = average(candle.volume for candle in dead_window)
+    previous_average = average(candle.volume for candle in history[-BREAKOUT_LOOKBACK:])
+    if previous_average <= 0 or dead_average <= 0:
+        return None
+
+    quiet_high = max(candle.high for candle in breakout_window)
+    quiet_low = min(candle.low for candle in breakout_window)
+    quiet_mid = (quiet_high + quiet_low) / 2
+    quiet_range_pct = percent_change(quiet_high, quiet_low)
+    if quiet_mid <= 0 or quiet_range_pct > MAX_QUIET_RANGE_PCT:
+        return None
+
+    is_dead_volume = dead_average <= previous_average * DEAD_VOLUME_RATIO
+    is_spike = spike_candle.volume >= dead_average * SPIKE_MULTIPLIER
+    has_minimum_liquidity = spike_candle.quote_volume >= MIN_QUOTE_VOLUME
+    if not (is_dead_volume and is_spike and has_minimum_liquidity):
+        return None
+
+    upper_break_pct = percent_change(spike_candle.close, quiet_high)
+    lower_break_pct = percent_change(quiet_low, spike_candle.close)
+    max_extension = MAX_EXTENSION_FROM_RANGE_PCT
+
+    if (
+        upper_break_pct >= MIN_BREAK_PCT
+        and upper_break_pct <= max_extension
+        and is_real_breakout_candle(spike_candle)
+        and close_location(spike_candle) >= MIN_CLOSE_LOCATION
+    ):
+        return Signal(
+            pair=pair,
+            direction="BREAKOUT",
+            candle=spike_candle,
+            dead_average=dead_average,
+            previous_average=previous_average,
+            breakout_level=quiet_high,
+            spike_ratio=spike_candle.volume / dead_average,
+            quiet_range_pct=quiet_range_pct,
+            break_pct=upper_break_pct,
+        )
+    if (
+        lower_break_pct >= MIN_BREAK_PCT
+        and lower_break_pct <= max_extension
+        and is_real_breakdown_candle(spike_candle)
+        and close_location(spike_candle) <= (1 - MIN_CLOSE_LOCATION)
+    ):
+        return Signal(
+            pair=pair,
+            direction="BREAKDOWN",
+            candle=spike_candle,
+            dead_average=dead_average,
+            previous_average=previous_average,
+            breakout_level=quiet_low,
+            spike_ratio=spike_candle.volume / dead_average,
+            quiet_range_pct=quiet_range_pct,
+            break_pct=lower_break_pct,
+        )
+    return None
+
+
+def detect_signal(pair: str, candles: list[Candle]) -> Signal | None:
+    minimum_needed = max(DEAD_VOLUME_LOOKBACK, BREAKOUT_LOOKBACK) + BREAKOUT_LOOKBACK + 2
+    if len(candles) < minimum_needed:
+        return None
+
+    closed_candles = candles[:-1]
+    first_trigger_index = max(len(closed_candles) - TRIGGER_LOOKBACK, 0)
+    for trigger_index in range(first_trigger_index, len(closed_candles)):
+        signal = build_signal(pair, closed_candles, trigger_index)
+        if signal:
+            return signal
+    return None
+
+
 def format_alert(signal: Signal) -> str:
     emoji = "🚀" if signal.direction == "BREAKOUT" else "🔻"
     return (
@@ -204,6 +333,8 @@ def format_alert(signal: Signal) -> str:
         f"Close: {signal.candle.close:g}\n"
         f"Level: {signal.breakout_level:g}\n"
         f"Volume spike: {signal.spike_ratio:.2f}x dead-volume average\n"
+        f"Quiet range: {signal.quiet_range_pct:.2f}%\n"
+        f"Break strength: {signal.break_pct:.2f}%\n"
         f"Dead avg volume: {signal.dead_average:.4f}\n"
         f"Previous avg volume: {signal.previous_average:.4f}\n"
         f"Quote volume: {signal.candle.quote_volume:.2f} USDT\n"
