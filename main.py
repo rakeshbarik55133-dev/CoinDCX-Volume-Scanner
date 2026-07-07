@@ -35,7 +35,6 @@ MIN_QUOTE_VOLUME = float(os.getenv("MIN_QUOTE_VOLUME", "1000"))
 SCAN_SLEEP_SECONDS = float(os.getenv("SCAN_SLEEP_SECONDS", "0.25"))
 MAX_PAIRS = int(os.getenv("MAX_PAIRS", "0"))
 
-TRIGGER_LOOKBACK = int(os.getenv("TRIGGER_LOOKBACK", "3"))
 DEAD_VOLUME_RATIO = float(os.getenv("DEAD_VOLUME_RATIO", "0.72"))
 SPIKE_MULTIPLIER = float(os.getenv("SPIKE_MULTIPLIER", "2.2"))
 MAX_QUIET_RANGE_PCT = float(os.getenv("MAX_QUIET_RANGE_PCT", "3.0"))
@@ -43,6 +42,7 @@ MIN_BREAK_PCT = float(os.getenv("MIN_BREAK_PCT", "0.18"))
 MIN_BODY_PCT = float(os.getenv("MIN_BODY_PCT", "0.35"))
 MIN_CLOSE_LOCATION = float(os.getenv("MIN_CLOSE_LOCATION", "0.62"))
 MAX_EXTENSION_FROM_RANGE_PCT = float(os.getenv("MAX_EXTENSION_FROM_RANGE_PCT", "9.0"))
+CONFIRMATION_WINDOW_CANDLES = int(os.getenv("CONFIRMATION_WINDOW_CANDLES", "5"))
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -76,10 +76,11 @@ class Signal:
     spike_ratio: float
     quiet_range_pct: float
     break_pct: float
+    confirmation_candle: Candle
 
     @property
     def alert_key(self) -> str:
-        return f"{self.pair}:{self.direction}:{self.candle.timestamp}"
+        return f"{self.pair}:{self.direction}:{self.confirmation_candle.timestamp}"
 
 
 def as_float(value: Any) -> float:
@@ -156,54 +157,58 @@ def average(values: Iterable[float]) -> float:
     return sum(numbers) / len(numbers) if numbers else 0.0
 
 
+def confirms_trigger_break(signal: Signal, confirmation_candle: Candle) -> bool:
+    if signal.direction == "BREAKOUT":
+        return confirmation_candle.close > signal.candle.high
+    return confirmation_candle.close < signal.candle.low
+
+
+def with_confirmation(signal: Signal, confirmation_candle: Candle) -> Signal:
+    return Signal(
+        pair=signal.pair,
+        direction=signal.direction,
+        candle=signal.candle,
+        dead_average=signal.dead_average,
+        previous_average=signal.previous_average,
+        breakout_level=signal.breakout_level,
+        spike_ratio=signal.spike_ratio,
+        quiet_range_pct=signal.quiet_range_pct,
+        break_pct=signal.break_pct,
+        confirmation_candle=confirmation_candle,
+    )
+
+
 def detect_signal(pair: str, candles: list[Candle]) -> Signal | None:
-    minimum_needed = DEAD_VOLUME_LOOKBACK + BREAKOUT_LOOKBACK + 2
+    minimum_needed = max(DEAD_VOLUME_LOOKBACK, BREAKOUT_LOOKBACK) + BREAKOUT_LOOKBACK + 2
     if len(candles) < minimum_needed:
         return None
 
     closed_candles = candles[:-1]
-    spike_candle = closed_candles[-1]
-    dead_window = closed_candles[-(DEAD_VOLUME_LOOKBACK + 1) : -1]
-    history = closed_candles[: -(DEAD_VOLUME_LOOKBACK + 1)]
-    breakout_window = closed_candles[-(BREAKOUT_LOOKBACK + 1) : -1]
+    latest_closed_index = len(closed_candles) - 1
+    candidate_index = 0
+    while candidate_index < latest_closed_index:
+        signal = build_signal(pair, closed_candles, candidate_index)
+        if not signal:
+            candidate_index += 1
+            continue
 
-    if len(dead_window) < DEAD_VOLUME_LOOKBACK or len(history) < BREAKOUT_LOOKBACK:
-        return None
+        window_end_index = min(candidate_index + CONFIRMATION_WINDOW_CANDLES, latest_closed_index)
+        confirmation_index = None
+        for watch_index in range(candidate_index + 1, window_end_index + 1):
+            if confirms_trigger_break(signal, closed_candles[watch_index]):
+                confirmation_index = watch_index
+                break
 
-    dead_average = average(candle.volume for candle in dead_window)
-    previous_average = average(candle.volume for candle in history[-BREAKOUT_LOOKBACK:])
-    if previous_average <= 0 or dead_average <= 0:
-        return None
+        if confirmation_index is None:
+            if latest_closed_index <= candidate_index + CONFIRMATION_WINDOW_CANDLES:
+                return None
+            candidate_index += CONFIRMATION_WINDOW_CANDLES + 1
+            continue
 
-    is_dead_volume = dead_average <= previous_average * DEAD_VOLUME_RATIO
-    is_spike = spike_candle.volume >= dead_average * SPIKE_MULTIPLIER
-    has_minimum_liquidity = spike_candle.quote_volume >= MIN_QUOTE_VOLUME
-    if not (is_dead_volume and is_spike and has_minimum_liquidity):
-        return None
+        if confirmation_index == latest_closed_index:
+            return with_confirmation(signal, closed_candles[confirmation_index])
 
-    prior_high = max(candle.high for candle in breakout_window)
-    prior_low = min(candle.low for candle in breakout_window)
-
-    if spike_candle.close > prior_high:
-        return Signal(
-            pair=pair,
-            direction="BREAKOUT",
-            candle=spike_candle,
-            dead_average=dead_average,
-            previous_average=previous_average,
-            breakout_level=prior_high,
-            spike_ratio=spike_candle.volume / dead_average,
-        )
-    if spike_candle.close < prior_low:
-        return Signal(
-            pair=pair,
-            direction="BREAKDOWN",
-            candle=spike_candle,
-            dead_average=dead_average,
-            previous_average=previous_average,
-            breakout_level=prior_low,
-            spike_ratio=spike_candle.volume / dead_average,
-        )
+        candidate_index = confirmation_index + 1
     return None
 
 
@@ -290,6 +295,7 @@ def build_signal(pair: str, closed_candles: list[Candle], trigger_index: int) ->
             spike_ratio=spike_candle.volume / dead_average,
             quiet_range_pct=quiet_range_pct,
             break_pct=upper_break_pct,
+            confirmation_candle=spike_candle,
         )
     if (
         lower_break_pct >= MIN_BREAK_PCT
@@ -307,21 +313,8 @@ def build_signal(pair: str, closed_candles: list[Candle], trigger_index: int) ->
             spike_ratio=spike_candle.volume / dead_average,
             quiet_range_pct=quiet_range_pct,
             break_pct=lower_break_pct,
+            confirmation_candle=spike_candle,
         )
-    return None
-
-
-def detect_signal(pair: str, candles: list[Candle]) -> Signal | None:
-    minimum_needed = max(DEAD_VOLUME_LOOKBACK, BREAKOUT_LOOKBACK) + BREAKOUT_LOOKBACK + 2
-    if len(candles) < minimum_needed:
-        return None
-
-    closed_candles = candles[:-1]
-    first_trigger_index = max(len(closed_candles) - TRIGGER_LOOKBACK, 0)
-    for trigger_index in range(first_trigger_index, len(closed_candles)):
-        signal = build_signal(pair, closed_candles, trigger_index)
-        if signal:
-            return signal
     return None
 
 
@@ -338,7 +331,8 @@ def format_alert(signal: Signal) -> str:
         f"Dead avg volume: {signal.dead_average:.4f}\n"
         f"Previous avg volume: {signal.previous_average:.4f}\n"
         f"Quote volume: {signal.candle.quote_volume:.2f} USDT\n"
-        f"Candle time: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(signal.candle.timestamp / 1000))}"
+        f"Trigger candle time: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(signal.candle.timestamp / 1000))}\n"
+        f"Alert candle time: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(signal.confirmation_candle.timestamp / 1000))}"
     )
 
 
