@@ -201,7 +201,11 @@ def parse_candle_response(payload: Any) -> list[Candle]:
     return sorted(valid_candles, key=lambda item: item.timestamp)
 
 
+ codex/fix-coindcx-candle-fetching-issue-la3ynk
 def get_candles(session: requests.Session, pair: str, *, log_response: bool = False) -> list[Candle]:
+
+def get_candles(session: requests.Session, pair: str) -> list[Candle]:
+ main
     response = session.get(
         COINDCX_CANDLES_URL,
         params={"pair": pair, "interval": INTERVAL, "limit": CANDLE_LIMIT},
