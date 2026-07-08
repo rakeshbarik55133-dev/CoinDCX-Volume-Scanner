@@ -1,6 +1,6 @@
 import unittest
 
-from main import Candle, detect_signal, evaluate_signal
+from main import Candle, get_candles, get_usdt_pairs, detect_signal, evaluate_signal
 
 
 def candle(
@@ -19,6 +19,86 @@ def candle(
         volume=volume,
         timestamp=timestamp,
     )
+
+
+class CoinDCXCandleFetchTests(unittest.TestCase):
+    def test_get_usdt_pairs_uses_market_details_pair_for_candle_api(self) -> None:
+        class Response:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> list[dict[str, str]]:
+                return [
+                    {
+                        "coindcx_name": "BTCUSDT",
+                        "base_currency_short_name": "USDT",
+                        "pair": "B-BTC_USDT",
+                        "status": "active",
+                    },
+                    {
+                        "coindcx_name": "ETHBTC",
+                        "base_currency_short_name": "BTC",
+                        "pair": "B-ETH_BTC",
+                        "status": "active",
+                    },
+                ]
+
+        class Session:
+            def get(self, *args, **kwargs) -> Response:
+                return Response()
+
+        self.assertEqual(get_usdt_pairs(Session()), ["B-BTC_USDT"])
+
+    def test_get_candles_parses_descending_api_candles_chronologically(self) -> None:
+        class Response:
+            def raise_for_status(self) -> None:
+                return None
+
+            status_code = 200
+            text = "[]"
+
+            def json(self) -> list[dict[str, str]]:
+                return [
+                    {"open": "2", "high": "3", "low": "1", "close": "2.5", "volume": "10", "time": "2000"},
+                    {"open": "1", "high": "2", "low": "0.5", "close": "1.5", "volume": "8", "time": "1000"},
+                ]
+
+        class Session:
+            params: dict[str, object]
+
+            def get(self, _url, params, timeout) -> Response:
+                self.params = params
+                return Response()
+
+        session = Session()
+        candles = get_candles(session, "B-BTC_USDT")
+
+        self.assertEqual(session.params["pair"], "B-BTC_USDT")
+        self.assertEqual([item.timestamp for item in candles], [1000, 2000])
+        self.assertEqual(candles[0].close, 1.5)
+
+    def test_get_candles_parses_array_candles_chronologically(self) -> None:
+        class Response:
+            status_code = 200
+            text = "[]"
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> list[list[object]]:
+                return [
+                    [2000, "2", "3", "1", "2.5", "10"],
+                    [1000, "1", "2", "0.5", "1.5", "8"],
+                ]
+
+        class Session:
+            def get(self, _url, params, timeout) -> Response:
+                return Response()
+
+        candles = get_candles(Session(), "B-BTC_USDT")
+
+        self.assertEqual([item.timestamp for item in candles], [1000, 2000])
+        self.assertEqual(candles[1].volume, 10)
 
 
 class DeadVolumeSpikeBreakoutTests(unittest.TestCase):
