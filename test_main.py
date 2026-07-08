@@ -54,6 +54,9 @@ class CoinDCXCandleFetchTests(unittest.TestCase):
             def raise_for_status(self) -> None:
                 return None
 
+            status_code = 200
+            text = "[]"
+
             def json(self) -> list[dict[str, str]]:
                 return [
                     {"open": "2", "high": "3", "low": "1", "close": "2.5", "volume": "10", "time": "2000"},
@@ -73,6 +76,50 @@ class CoinDCXCandleFetchTests(unittest.TestCase):
         self.assertEqual(session.params["pair"], "B-BTC_USDT")
         self.assertEqual([item.timestamp for item in candles], [1000, 2000])
         self.assertEqual(candles[0].close, 1.5)
+
+    def test_get_candles_parses_array_candles_chronologically(self) -> None:
+        class Response:
+            status_code = 200
+            text = "[]"
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> list[list[object]]:
+                return [
+                    [2000, "2", "3", "1", "2.5", "10"],
+                    [1000, "1", "2", "0.5", "1.5", "8"],
+                ]
+
+        class Session:
+            def get(self, _url, params, timeout) -> Response:
+                return Response()
+
+        candles = get_candles(Session(), "B-BTC_USDT")
+
+        self.assertEqual([item.timestamp for item in candles], [1000, 2000])
+        self.assertEqual(candles[1].volume, 10)
+
+    def test_get_candles_logs_sample_status_and_body_at_info(self) -> None:
+        class Response:
+            status_code = 200
+            text = '[{"time":"1000"}]'
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> list[dict[str, str]]:
+                return [{"open": "1", "high": "1", "low": "1", "close": "1", "volume": "1", "time": "1000"}]
+
+        class Session:
+            def get(self, _url, params, timeout) -> Response:
+                return Response()
+
+        with self.assertLogs("main", level="INFO") as logs:
+            get_candles(Session(), "B-BTC_USDT", log_response=True)
+
+        self.assertIn("status=200", logs.output[0])
+        self.assertIn(Response.text, logs.output[0])
 
 
 class DeadVolumeSpikeBreakoutTests(unittest.TestCase):

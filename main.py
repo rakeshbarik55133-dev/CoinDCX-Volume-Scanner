@@ -21,7 +21,7 @@ from typing import Any, Iterable
 import requests
 
 COINDCX_MARKETS_URL = "https://api.coindcx.com/exchange/v1/markets_details"
-COINDCX_CANDLES_URL = "https://public.coindcx.com/market_data/candles/"
+COINDCX_CANDLES_URL = "https://public.coindcx.com/market_data/candles"
 TELEGRAM_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
 INTERVAL = "15m"
@@ -166,7 +166,18 @@ def get_usdt_pairs(session: requests.Session) -> list[str]:
     return unique_pairs
 
 
-def normalize_candle(raw: dict[str, Any]) -> Candle:
+def normalize_candle(raw: dict[str, Any] | list[Any]) -> Candle:
+    if isinstance(raw, list):
+        timestamp, open_price, high, low, close, volume = (raw + [0] * 6)[:6]
+        return Candle(
+            open=as_float(open_price),
+            high=as_float(high),
+            low=as_float(low),
+            close=as_float(close),
+            volume=as_float(volume),
+            timestamp=int(as_float(timestamp)),
+        )
+
     return Candle(
         open=as_float(raw.get("open")),
         high=as_float(raw.get("high")),
@@ -185,17 +196,28 @@ def parse_candle_response(payload: Any) -> list[Candle]:
     else:
         raw_candles = []
 
-    candles = [normalize_candle(item) for item in raw_candles if isinstance(item, dict)]
+    candles = [normalize_candle(item) for item in raw_candles if isinstance(item, (dict, list))]
     valid_candles = (candle for candle in candles if candle.timestamp)
     return sorted(valid_candles, key=lambda item: item.timestamp)
 
 
+ codex/fix-coindcx-candle-fetching-issue-la3ynk
+def get_candles(session: requests.Session, pair: str, *, log_response: bool = False) -> list[Candle]:
+
 def get_candles(session: requests.Session, pair: str) -> list[Candle]:
+ main
     response = session.get(
         COINDCX_CANDLES_URL,
         params={"pair": pair, "interval": INTERVAL, "limit": CANDLE_LIMIT},
         timeout=REQUEST_TIMEOUT,
     )
+    if log_response:
+        LOGGER.info(
+            "Sample CoinDCX candles response for %s: status=%s body=%s",
+            pair,
+            response.status_code,
+            response.text,
+        )
     response.raise_for_status()
     return parse_candle_response(response.json())
 
@@ -445,9 +467,12 @@ def run_scan() -> int:
         valid_signals: list[Signal] = []
         rejection_counts: Counter[str] = Counter()
         sample_candle_counts: dict[str, int] = {}
+        sample_response_logged = False
         for pair in pairs:
             try:
-                candles = get_candles(session, pair)
+                log_response = not sample_response_logged
+                candles = get_candles(session, pair, log_response=log_response)
+                sample_response_logged = sample_response_logged or log_response
                 if len(sample_candle_counts) < 3:
                     sample_candle_counts[pair] = len(candles)
                 evaluation = evaluate_signal(pair, candles)
