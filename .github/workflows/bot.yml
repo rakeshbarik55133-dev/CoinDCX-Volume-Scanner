@@ -46,7 +46,9 @@ jobs:
           import main
 
           print(main.COINDCX_MARKETS_URL)
+          print(main.COINDCX_CANDLES_URL)
           assert main.COINDCX_MARKETS_URL == "https://api.coindcx.com/exchange/v1/markets_details"
+          assert main.COINDCX_CANDLES_URL == "https://public.coindcx.com/market_data/candles"
           PY
 
       - name: Run CoinDCX scanner
