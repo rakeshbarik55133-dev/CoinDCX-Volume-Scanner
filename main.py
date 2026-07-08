@@ -152,13 +152,13 @@ def get_usdt_pairs(session: requests.Session) -> list[str]:
 
     pairs: list[str] = []
     for market in markets:
-        if not market.get("coindcx_name"):
+        if not market.get("coindcx_name") or not market.get("pair"):
             continue
         if market.get("base_currency_short_name") != "USDT":
             continue
         if market.get("status", "active").lower() not in {"active", "online"}:
             continue
-        pairs.append(str(market["coindcx_name"]))
+        pairs.append(str(market["pair"]))
 
     unique_pairs = sorted(set(pairs))
     if MAX_PAIRS > 0:
@@ -177,6 +177,19 @@ def normalize_candle(raw: dict[str, Any]) -> Candle:
     )
 
 
+def parse_candle_response(payload: Any) -> list[Candle]:
+    if isinstance(payload, dict):
+        raw_candles = payload.get("data") or payload.get("candles") or []
+    elif isinstance(payload, list):
+        raw_candles = payload
+    else:
+        raw_candles = []
+
+    candles = [normalize_candle(item) for item in raw_candles if isinstance(item, dict)]
+    valid_candles = (candle for candle in candles if candle.timestamp)
+    return sorted(valid_candles, key=lambda item: item.timestamp)
+
+
 def get_candles(session: requests.Session, pair: str) -> list[Candle]:
     response = session.get(
         COINDCX_CANDLES_URL,
@@ -184,9 +197,7 @@ def get_candles(session: requests.Session, pair: str) -> list[Candle]:
         timeout=REQUEST_TIMEOUT,
     )
     response.raise_for_status()
-    candles = [normalize_candle(item) for item in response.json()]
-    valid_candles = (candle for candle in candles if candle.timestamp)
-    return sorted(valid_candles, key=lambda item: item.timestamp)
+    return parse_candle_response(response.json())
 
 
 def average(values: Iterable[float]) -> float:
@@ -433,9 +444,13 @@ def run_scan() -> int:
         LOGGER.info("Scanning %s CoinDCX USDT pairs on %s", len(pairs), INTERVAL)
         valid_signals: list[Signal] = []
         rejection_counts: Counter[str] = Counter()
+        sample_candle_counts: dict[str, int] = {}
         for pair in pairs:
             try:
-                evaluation = evaluate_signal(pair, get_candles(session, pair))
+                candles = get_candles(session, pair)
+                if len(sample_candle_counts) < 3:
+                    sample_candle_counts[pair] = len(candles)
+                evaluation = evaluate_signal(pair, candles)
             except requests.RequestException as exc:
                 LOGGER.warning("Skipping %s after API error: %s", pair, exc)
                 rejection_counts["api_error"] += 1
@@ -446,6 +461,9 @@ def run_scan() -> int:
             elif evaluation.rejection_reason:
                 rejection_counts[evaluation.rejection_reason] += 1
             time.sleep(SCAN_SLEEP_SECONDS)
+
+        if sample_candle_counts:
+            LOGGER.debug("Sample candle counts for first 3 pairs: %s", sample_candle_counts)
 
         LOGGER.info("Detected %s valid signal candidate(s)", len(valid_signals))
         if rejection_counts:
