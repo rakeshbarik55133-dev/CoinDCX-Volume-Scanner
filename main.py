@@ -13,6 +13,7 @@ import logging
 import math
 import os
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -109,6 +110,16 @@ class Signal:
         return "early range-edge ignition"
 
 
+@dataclass(frozen=True)
+class SignalEvaluation:
+    signal: Signal | None
+    rejection_reason: str | None = None
+
+    @property
+    def accepted(self) -> bool:
+        return self.signal is not None
+
+
 def as_float(value: Any) -> float:
     try:
         return float(value)
@@ -184,9 +195,13 @@ def average(values: Iterable[float]) -> float:
 
 
 def detect_signal(pair: str, candles: list[Candle]) -> Signal | None:
+    return evaluate_signal(pair, candles).signal
+
+
+def evaluate_signal(pair: str, candles: list[Candle]) -> SignalEvaluation:
     minimum_needed = max(DEAD_VOLUME_LOOKBACK, BREAKOUT_LOOKBACK) + BREAKOUT_LOOKBACK + 1
     if len(candles) < minimum_needed:
-        return None
+        return SignalEvaluation(None, "too_few_candles")
 
     closed_candles = candles[:-1]
     latest_closed_index = len(closed_candles) - 1
@@ -225,36 +240,40 @@ def is_real_breakdown_candle(candle: Candle) -> bool:
     return candle.close < candle.open and body_ratio(candle) >= MIN_BODY_PCT
 
 
-def build_signal(pair: str, closed_candles: list[Candle], trigger_index: int) -> Signal | None:
+def build_signal(pair: str, closed_candles: list[Candle], trigger_index: int) -> SignalEvaluation:
     spike_candle = closed_candles[trigger_index]
     dead_start = trigger_index - DEAD_VOLUME_LOOKBACK
     breakout_start = trigger_index - BREAKOUT_LOOKBACK
     if dead_start < 0 or breakout_start < 0:
-        return None
+        return SignalEvaluation(None, "insufficient_history_window")
 
     dead_window = closed_candles[dead_start:trigger_index]
     breakout_window = closed_candles[breakout_start:trigger_index]
     history = closed_candles[:dead_start]
     if len(dead_window) < DEAD_VOLUME_LOOKBACK or len(breakout_window) < BREAKOUT_LOOKBACK:
-        return None
+        return SignalEvaluation(None, "insufficient_history_window")
 
     dead_average = average(candle.volume for candle in dead_window)
     previous_average = average(candle.volume for candle in history[-BREAKOUT_LOOKBACK:])
     if previous_average <= 0 or dead_average <= 0:
-        return None
+        return SignalEvaluation(None, "zero_volume_average")
 
     quiet_high = max(candle.high for candle in breakout_window)
     quiet_low = min(candle.low for candle in breakout_window)
     quiet_mid = (quiet_high + quiet_low) / 2
     quiet_range_pct = percent_change(quiet_high, quiet_low)
     if quiet_mid <= 0 or quiet_range_pct > MAX_QUIET_RANGE_PCT:
-        return None
+        return SignalEvaluation(None, "quiet_range_too_wide")
 
     is_dead_volume = dead_average <= previous_average * DEAD_VOLUME_RATIO
     is_spike = spike_candle.volume >= dead_average * SPIKE_MULTIPLIER
     has_minimum_liquidity = spike_candle.quote_volume >= MIN_QUOTE_VOLUME
     if not (is_dead_volume and is_spike and has_minimum_liquidity):
-        return None
+        if not is_dead_volume:
+            return SignalEvaluation(None, "dead_volume_not_low_enough")
+        if not is_spike:
+            return SignalEvaluation(None, "volume_spike_too_small")
+        return SignalEvaluation(None, "quote_volume_too_low")
 
     upper_break_pct = percent_change(spike_candle.close, quiet_high)
     lower_break_pct = percent_change(quiet_low, spike_candle.close)
@@ -274,7 +293,7 @@ def build_signal(pair: str, closed_candles: list[Candle], trigger_index: int) ->
         and is_real_breakout_candle(spike_candle)
         and close_location(spike_candle) >= MIN_CLOSE_LOCATION
     ):
-        return Signal(
+        return SignalEvaluation(Signal(
             pair=pair,
             direction="BREAKOUT",
             candle=spike_candle,
@@ -285,14 +304,14 @@ def build_signal(pair: str, closed_candles: list[Candle], trigger_index: int) ->
             quiet_range_pct=quiet_range_pct,
             break_pct=max(upper_break_pct, 0.0),
             confirmation_candle=spike_candle,
-        )
+        ))
     if (
         (lower_break_pct >= MIN_BREAK_PCT or lower_range_edge_ignition)
         and lower_break_pct <= max_extension
         and is_real_breakdown_candle(spike_candle)
         and close_location(spike_candle) <= (1 - MIN_CLOSE_LOCATION)
     ):
-        return Signal(
+        return SignalEvaluation(Signal(
             pair=pair,
             direction="BREAKDOWN",
             candle=spike_candle,
@@ -303,8 +322,21 @@ def build_signal(pair: str, closed_candles: list[Candle], trigger_index: int) ->
             quiet_range_pct=quiet_range_pct,
             break_pct=max(lower_break_pct, 0.0),
             confirmation_candle=spike_candle,
-        )
-    return None
+        ))
+
+    if not (upper_break_pct >= MIN_BREAK_PCT or upper_range_edge_ignition or lower_break_pct >= MIN_BREAK_PCT or lower_range_edge_ignition):
+        return SignalEvaluation(None, "no_breakout_or_range_edge_touch")
+    if (upper_break_pct >= MIN_BREAK_PCT or upper_range_edge_ignition) and upper_break_pct > max_extension:
+        return SignalEvaluation(None, "breakout_overextended")
+    if (lower_break_pct >= MIN_BREAK_PCT or lower_range_edge_ignition) and lower_break_pct > max_extension:
+        return SignalEvaluation(None, "breakdown_overextended")
+    if upper_break_pct >= MIN_BREAK_PCT or upper_range_edge_ignition:
+        if not is_real_breakout_candle(spike_candle):
+            return SignalEvaluation(None, "breakout_body_too_weak")
+        return SignalEvaluation(None, "breakout_close_not_strong_enough")
+    if not is_real_breakdown_candle(spike_candle):
+        return SignalEvaluation(None, "breakdown_body_too_weak")
+    return SignalEvaluation(None, "breakdown_close_not_strong_enough")
 
 
 def current_day_key() -> str:
@@ -400,19 +432,29 @@ def run_scan() -> int:
         pairs = get_usdt_pairs(session)
         LOGGER.info("Scanning %s CoinDCX USDT pairs on %s", len(pairs), INTERVAL)
         valid_signals: list[Signal] = []
+        rejection_counts: Counter[str] = Counter()
         for pair in pairs:
             try:
-                signal = detect_signal(pair, get_candles(session, pair))
+                evaluation = evaluate_signal(pair, get_candles(session, pair))
             except requests.RequestException as exc:
                 LOGGER.warning("Skipping %s after API error: %s", pair, exc)
+                rejection_counts["api_error"] += 1
                 continue
 
-            if signal:
-                valid_signals.append(signal)
+            if evaluation.signal:
+                valid_signals.append(evaluation.signal)
+            elif evaluation.rejection_reason:
+                rejection_counts[evaluation.rejection_reason] += 1
             time.sleep(SCAN_SLEEP_SECONDS)
 
+        LOGGER.info("Detected %s valid signal candidate(s)", len(valid_signals))
+        if rejection_counts:
+            LOGGER.info("Signal rejection counts: %s", dict(rejection_counts.most_common()))
+
         day_key = current_day_key()
-        for rank, signal in select_daily_top_signals(valid_signals, sent_alerts, day_key):
+        selected_signals = select_daily_top_signals(valid_signals, sent_alerts, day_key)
+        LOGGER.info("Selected %s alert(s) after daily ranking and duplicate filters", len(selected_signals))
+        for rank, signal in selected_signals:
             send_telegram_alert(session, bot_token, chat_id, format_alert(signal, rank, day_key))
             sent_alerts.add(signal.alert_key)
             sent_alerts.add(daily_sent_key(day_key, signal.daily_direction, rank))

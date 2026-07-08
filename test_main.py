@@ -1,6 +1,6 @@
 import unittest
 
-from main import Candle, detect_signal
+from main import Candle, detect_signal, evaluate_signal
 
 
 def candle(
@@ -39,7 +39,6 @@ class DeadVolumeSpikeBreakoutTests(unittest.TestCase):
         candles = self.base_candles()
         candles.append(candle(100.35, 103.4, 100.2, 102.8, 190, 1_700_021_600_000))
         candles.append(candle(102.8, 103.8, 102.2, 103.6, 80, 1_700_022_500_000))
-        candles.append(candle(103.6, 103.9, 103.1, 103.4, 80, 1_700_023_400_000))
 
         signal = detect_signal("BLURUSDT", candles)
 
@@ -51,7 +50,6 @@ class DeadVolumeSpikeBreakoutTests(unittest.TestCase):
         candles = self.base_candles()
         candles.append(candle(99.8, 100.0, 96.6, 97.1, 190, 1_700_021_600_000))
         candles.append(candle(97.1, 97.3, 96.1, 96.4, 80, 1_700_022_500_000))
-        candles.append(candle(96.4, 97.8, 96.3, 97.4, 80, 1_700_023_400_000))
 
         signal = detect_signal("MUSDT", candles)
 
@@ -92,12 +90,15 @@ class DeadVolumeSpikeBreakoutTests(unittest.TestCase):
 
         self.assertIsNone(detect_signal("WICKUSDT", candles))
 
-    def test_does_not_alert_on_breakout_candle_itself(self) -> None:
+    def test_alerts_on_latest_closed_breakout_candle(self) -> None:
         candles = self.base_candles()
         candles.append(candle(100.35, 103.4, 100.2, 102.8, 190, 1_700_021_600_000))
         candles.append(candle(102.8, 102.9, 102.1, 102.4, 80, 1_700_022_500_000))
 
-        self.assertIsNone(detect_signal("WAITUSDT", candles))
+        signal = detect_signal("WAITUSDT", candles)
+
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.confirmation_candle.timestamp, 1_700_021_600_000)
 
     def test_rejects_setup_without_trigger_high_break(self) -> None:
         candles = self.base_candles()
@@ -124,20 +125,15 @@ class DeadVolumeSpikeBreakoutTests(unittest.TestCase):
 
         self.assertIsNone(detect_signal("LATEUSDT", candles))
 
-    def test_alerts_on_fifth_confirmation_candle(self) -> None:
+    def test_reports_rejection_reason_for_missing_volume_spike(self) -> None:
         candles = self.base_candles()
-        candles.append(candle(100.35, 103.4, 100.2, 102.8, 190, 1_700_021_600_000))
-        candles.append(candle(102.8, 103.2, 102.2, 103.1, 80, 1_700_022_500_000))
-        candles.append(candle(103.1, 103.3, 102.7, 103.2, 80, 1_700_023_400_000))
-        candles.append(candle(103.2, 103.3, 102.8, 103.1, 80, 1_700_024_300_000))
-        candles.append(candle(103.1, 103.2, 102.7, 103.0, 80, 1_700_025_200_000))
-        candles.append(candle(103.0, 103.8, 102.6, 103.6, 80, 1_700_026_100_000))
-        candles.append(candle(103.6, 103.9, 103.1, 103.5, 80, 1_700_027_000_000))
+        candles.append(candle(100.35, 103.4, 100.2, 102.8, 90, 1_700_021_600_000))
+        candles.append(candle(102.8, 103.8, 102.2, 103.6, 80, 1_700_022_500_000))
 
-        signal = detect_signal("FIFTHUSDT", candles)
+        evaluation = evaluate_signal("NOSPIKEUSDT", candles)
 
-        self.assertIsNotNone(signal)
-        self.assertEqual(signal.confirmation_candle.timestamp, 1_700_026_100_000)
+        self.assertIsNone(evaluation.signal)
+        self.assertEqual(evaluation.rejection_reason, "volume_spike_too_small")
 
 
 if __name__ == "__main__":
