@@ -2,7 +2,10 @@ name: CoinDCX Telegram Scanner
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    # Run every 15 minutes, offset from :00/:15/:30/:45 because GitHub
+    # Actions scheduled workflows are best-effort and are often delayed or
+    # dropped during high-load minute boundaries (especially the top of hour).
+    - cron: "7-59/15 * * * *"
   workflow_dispatch:
 
 permissions:
