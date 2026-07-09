@@ -25,25 +25,23 @@ SCAN_SLEEP_SECONDS = float(os.getenv("SCAN_SLEEP_SECONDS", "0.15"))
 STATE_FILE = Path(os.getenv("STATE_FILE", ".alert_state.json"))
 ALERT_PAIR_NAMES: dict[str, str] = {}
 
-# Photo-style setup only: a quiet/flat base, then the first strong candle that
-# breaks out/breaks down with sudden volume expansion. No RSI/EMA/MACD/ATR/BB.
+# Photo-style setup only: a true dead/quiet-volume, flat price base must be
+# selected first. Only then can a break of that base high/low during the next
+# 1 to 5 closed 15m candles alert. No RSI/EMA/MACD/ATR/BB or other indicators.
 BASE_LOOKBACK = 12
 DEAD_VOLUME_LOOKBACK = 8
 OLDER_VOLUME_LOOKBACK = 8
 MIN_HISTORY = BASE_LOOKBACK + OLDER_VOLUME_LOOKBACK
- codex/implement-dead-volume-breakout-strategy-bpvd9r
+MIN_CONFIRMATION_CANDLES = 1
+MAX_CONFIRMATION_CANDLES = 5
+
 MAX_BASE_RANGE_PCT = 0.018
 MAX_BASE_DRIFT_PCT = 0.008
-MIN_VOLUME_SPIKE_RATIO = 3.0
 MAX_DEAD_TO_OLDER_VOLUME_RATIO = 0.6
 MAX_BASE_VOLUME_VARIATION_RATIO = 1.8
-MIN_BODY_TO_RANGE_RATIO = 0.6
 MIN_BREAK_DISTANCE_PCT = 0.002
-
-MAX_BASE_RANGE_PCT = 0.035
-MIN_VOLUME_SPIKE_RATIO = 2.0
-MIN_BODY_TO_RANGE_RATIO = 0.45
- main
+MIN_BREAK_VOLUME_RATIO = 2.0
+MAX_CONFIRMATION_EXTENSION_PCT = 0.12
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -222,14 +220,15 @@ def _mean(values: list[float]) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
-def _evaluate_at(pair: str, candles: list[Candle], index: int) -> SignalEvaluation:
-    if index < MIN_HISTORY:
+def _evaluate_dead_volume_base(pair: str, candles: list[Candle], base_end_index: int) -> SignalEvaluation:
+    if base_end_index < MIN_HISTORY - 1:
         return SignalEvaluation(None, "not_enough_history")
 
-    # Dead/quiet-volume selection happens before any breakout/breakdown check.
-    trigger = candles[index]
-    base = candles[index - BASE_LOOKBACK:index]
-    older = candles[index - MIN_HISTORY:index - BASE_LOOKBACK]
+    base_start = base_end_index - BASE_LOOKBACK + 1
+    older_start = base_start - OLDER_VOLUME_LOOKBACK
+    base = candles[base_start : base_end_index + 1]
+    older = candles[older_start:base_start]
+
     base_high = max(candle.high for candle in base)
     base_low = min(candle.low for candle in base)
     base_mid = (base_high + base_low) / 2
@@ -240,50 +239,85 @@ def _evaluate_at(pair: str, candles: list[Candle], index: int) -> SignalEvaluati
     if base_drift > MAX_BASE_DRIFT_PCT:
         return SignalEvaluation(None, "base_trending")
 
-    base_volume = _mean([candle.volume for candle in base[-DEAD_VOLUME_LOOKBACK:]])
+    quiet_base = base[-DEAD_VOLUME_LOOKBACK:]
+    base_volume = _mean([candle.volume for candle in quiet_base])
     older_volume = _mean([candle.volume for candle in older[-OLDER_VOLUME_LOOKBACK:]])
     if base_volume <= 0:
         return SignalEvaluation(None, "base_volume_zero")
-    if older_volume > 0 and base_volume > older_volume * MAX_DEAD_TO_OLDER_VOLUME_RATIO:
+    if older_volume <= 0:
+        return SignalEvaluation(None, "older_volume_zero")
+    if base_volume > older_volume * MAX_DEAD_TO_OLDER_VOLUME_RATIO:
         return SignalEvaluation(None, "base_volume_not_dead")
-    if max(candle.volume for candle in base[-DEAD_VOLUME_LOOKBACK:]) > base_volume * MAX_BASE_VOLUME_VARIATION_RATIO:
+    if max(candle.volume for candle in quiet_base) > base_volume * MAX_BASE_VOLUME_VARIATION_RATIO:
         return SignalEvaluation(None, "base_volume_not_consistent")
 
+    return SignalEvaluation(
+        Signal(pair=pair, side="BASE", candle=base[-1], average_volume=base_volume, volume_ratio=1.0, break_level=base_high)
+    )
+
+
+def _break_signal_from_base(
+    pair: str,
+    trigger: Candle,
+    base_high: float,
+    base_low: float,
+    base_volume: float,
+) -> SignalEvaluation:
     volume_ratio = trigger.volume / base_volume
-    if volume_ratio < MIN_VOLUME_SPIKE_RATIO:
+    if volume_ratio < MIN_BREAK_VOLUME_RATIO:
         return SignalEvaluation(None, "volume_spike_too_small")
 
-    candle_range = trigger.high - trigger.low
-    body = abs(trigger.close - trigger.open)
-    if candle_range <= 0 or body / candle_range < MIN_BODY_TO_RANGE_RATIO:
-        return SignalEvaluation(None, "trigger_body_too_weak")
-
-    # Photo-style first break only: latest candle must start from the dead base
-    # and close beyond the recent high/low; opening past the level is extended.
-    if trigger.close > trigger.open and trigger.open <= base_high and trigger.close > base_high:
- codex/implement-dead-volume-breakout-strategy-bpvd9r
+    if trigger.close > base_high:
         if (trigger.close - base_high) / base_high < MIN_BREAK_DISTANCE_PCT:
             return SignalEvaluation(None, "weak_breakout")
+        if (trigger.close - base_high) / base_high > MAX_CONFIRMATION_EXTENSION_PCT:
+            return SignalEvaluation(None, "trigger_extended")
         return SignalEvaluation(Signal(pair, "BUY", trigger, base_volume, volume_ratio, base_high))
 
-    if trigger.close < trigger.open and trigger.open >= base_low and trigger.close < base_low:
+    if trigger.close < base_low:
         if (base_low - trigger.close) / base_low < MIN_BREAK_DISTANCE_PCT:
-            return SignalEvaluation(None, "weak_breakout")
-
-        return SignalEvaluation(Signal(pair, "BUY", trigger, base_volume, volume_ratio, base_high))
-
-    if trigger.close < trigger.open and trigger.open >= base_low and trigger.close < base_low:
- main
+            return SignalEvaluation(None, "weak_breakdown")
+        if (base_low - trigger.close) / base_low > MAX_CONFIRMATION_EXTENSION_PCT:
+            return SignalEvaluation(None, "trigger_extended")
         return SignalEvaluation(Signal(pair, "SELL", trigger, base_volume, volume_ratio, base_low))
 
     return SignalEvaluation(None, "no_base_break")
 
 
+def _evaluate_at(pair: str, candles: list[Candle], index: int) -> SignalEvaluation:
+    if index < MIN_HISTORY:
+        return SignalEvaluation(None, "not_enough_history")
+
+    last_rejection = "no_dead_volume_base"
+    for candles_after_base in range(MIN_CONFIRMATION_CANDLES, MAX_CONFIRMATION_CANDLES + 1):
+        base_end_index = index - candles_after_base
+        base_evaluation = _evaluate_dead_volume_base(pair, candles, base_end_index)
+        if base_evaluation.signal is None:
+            last_rejection = base_evaluation.rejection_reason or last_rejection
+            continue
+
+        base_start = base_end_index - BASE_LOOKBACK + 1
+        base = candles[base_start : base_end_index + 1]
+        base_high = max(candle.high for candle in base)
+        base_low = min(candle.low for candle in base)
+        base_volume = base_evaluation.signal.average_volume
+
+        # Expire this dead-volume setup if any earlier confirmation candle already
+        # broke either side; the scanner alerts only on the first 1-5 candle break.
+        prior_confirmation = candles[base_end_index + 1 : index]
+        if any(candle.close > base_high or candle.close < base_low for candle in prior_confirmation):
+            last_rejection = "setup_already_broke"
+            continue
+
+        return _break_signal_from_base(pair, candles[index], base_high, base_low, base_volume)
+
+    return SignalEvaluation(None, last_rejection)
+
+
 def evaluate_signal(pair: str, candles: list[Candle]) -> SignalEvaluation:
-    if len(candles) < MIN_HISTORY + 1:
+    if len(candles) < MIN_HISTORY + MIN_CONFIRMATION_CANDLES:
         return SignalEvaluation(None, "not_enough_history")
     return _evaluate_at(pair, candles, len(candles) - 1)
-
 
 def detect_signal(pair: str, candles: list[Candle]) -> Signal | None:
     return evaluate_signal(pair, candles).signal
