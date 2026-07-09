@@ -31,9 +31,19 @@ BASE_LOOKBACK = 12
 DEAD_VOLUME_LOOKBACK = 8
 OLDER_VOLUME_LOOKBACK = 8
 MIN_HISTORY = BASE_LOOKBACK + OLDER_VOLUME_LOOKBACK
+ codex/implement-dead-volume-breakout-strategy-bpvd9r
+MAX_BASE_RANGE_PCT = 0.018
+MAX_BASE_DRIFT_PCT = 0.008
+MIN_VOLUME_SPIKE_RATIO = 3.0
+MAX_DEAD_TO_OLDER_VOLUME_RATIO = 0.6
+MAX_BASE_VOLUME_VARIATION_RATIO = 1.8
+MIN_BODY_TO_RANGE_RATIO = 0.6
+MIN_BREAK_DISTANCE_PCT = 0.002
+
 MAX_BASE_RANGE_PCT = 0.035
 MIN_VOLUME_SPIKE_RATIO = 2.0
 MIN_BODY_TO_RANGE_RATIO = 0.45
+ main
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -226,12 +236,18 @@ def _evaluate_at(pair: str, candles: list[Candle], index: int) -> SignalEvaluati
     if base_mid <= 0 or (base_high - base_low) / base_mid > MAX_BASE_RANGE_PCT:
         return SignalEvaluation(None, "base_not_flat")
 
+    base_drift = abs(base[-1].close - base[0].open) / base_mid
+    if base_drift > MAX_BASE_DRIFT_PCT:
+        return SignalEvaluation(None, "base_trending")
+
     base_volume = _mean([candle.volume for candle in base[-DEAD_VOLUME_LOOKBACK:]])
     older_volume = _mean([candle.volume for candle in older[-OLDER_VOLUME_LOOKBACK:]])
     if base_volume <= 0:
         return SignalEvaluation(None, "base_volume_zero")
-    if older_volume > 0 and base_volume > older_volume * 0.8:
+    if older_volume > 0 and base_volume > older_volume * MAX_DEAD_TO_OLDER_VOLUME_RATIO:
         return SignalEvaluation(None, "base_volume_not_dead")
+    if max(candle.volume for candle in base[-DEAD_VOLUME_LOOKBACK:]) > base_volume * MAX_BASE_VOLUME_VARIATION_RATIO:
+        return SignalEvaluation(None, "base_volume_not_consistent")
 
     volume_ratio = trigger.volume / base_volume
     if volume_ratio < MIN_VOLUME_SPIKE_RATIO:
@@ -245,9 +261,19 @@ def _evaluate_at(pair: str, candles: list[Candle], index: int) -> SignalEvaluati
     # Photo-style first break only: latest candle must start from the dead base
     # and close beyond the recent high/low; opening past the level is extended.
     if trigger.close > trigger.open and trigger.open <= base_high and trigger.close > base_high:
+ codex/implement-dead-volume-breakout-strategy-bpvd9r
+        if (trigger.close - base_high) / base_high < MIN_BREAK_DISTANCE_PCT:
+            return SignalEvaluation(None, "weak_breakout")
         return SignalEvaluation(Signal(pair, "BUY", trigger, base_volume, volume_ratio, base_high))
 
     if trigger.close < trigger.open and trigger.open >= base_low and trigger.close < base_low:
+        if (base_low - trigger.close) / base_low < MIN_BREAK_DISTANCE_PCT:
+            return SignalEvaluation(None, "weak_breakout")
+
+        return SignalEvaluation(Signal(pair, "BUY", trigger, base_volume, volume_ratio, base_high))
+
+    if trigger.close < trigger.open and trigger.open >= base_low and trigger.close < base_low:
+ main
         return SignalEvaluation(Signal(pair, "SELL", trigger, base_volume, volume_ratio, base_low))
 
     return SignalEvaluation(None, "no_base_break")
