@@ -1,4 +1,4 @@
-"""CoinDCX USDT 15-minute Volume + Price Action Telegram scanner."""
+"""CoinDCX USDT 15-minute photo-style breakout/breakdown Telegram scanner."""
 
 from __future__ import annotations
 
@@ -18,12 +18,21 @@ TELEGRAM_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
 INTERVAL = "15m"
 INTERVAL_MS = 15 * 60 * 1000
-LOOKBACK = 20
-VOLUME_MULTIPLIER = 3.0
-CANDLE_LIMIT = 60
+CANDLE_LIMIT = 80
 REQUEST_TIMEOUT = 20
 SCAN_SLEEP_SECONDS = float(os.getenv("SCAN_SLEEP_SECONDS", "0.15"))
 STATE_FILE = Path(os.getenv("STATE_FILE", ".alert_state.json"))
+
+# Photo-style setup only: a quiet/flat base, then the first strong candle that
+# breaks out/breaks down with sudden volume expansion. No RSI/EMA/MACD/ATR/BB.
+BASE_LOOKBACK = 12
+DEAD_VOLUME_LOOKBACK = 8
+OLDER_VOLUME_LOOKBACK = 8
+MIN_HISTORY = BASE_LOOKBACK + OLDER_VOLUME_LOOKBACK
+MAX_BASE_RANGE_PCT = 0.035
+MIN_VOLUME_SPIKE_RATIO = 2.2
+MAX_EXTENSION_FROM_BASE_PCT = 0.08
+MIN_BODY_TO_RANGE_RATIO = 0.55
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -55,6 +64,24 @@ class Signal:
     def alert_key(self) -> str:
         return f"{self.pair}:{self.side}:{self.candle.timestamp}"
 
+    @property
+    def direction(self) -> str:
+        return "BREAKOUT" if self.side == "BUY" else "BREAKDOWN"
+
+    @property
+    def spike_ratio(self) -> float:
+        return self.volume_ratio
+
+    @property
+    def confirmation_candle(self) -> Candle:
+        return self.candle
+
+
+@dataclass(frozen=True)
+class SignalEvaluation:
+    signal: Signal | None
+    rejection_reason: str | None = None
+
 
 def as_float(value: Any) -> float:
     try:
@@ -65,7 +92,7 @@ def as_float(value: Any) -> float:
 
 def normalize_timestamp(value: Any) -> int:
     timestamp = int(as_float(value))
-    if 0 < timestamp < 10_000_000_000:
+    if 1_000_000_000 <= timestamp < 10_000_000_000:
         return timestamp * 1000
     return timestamp
 
@@ -151,12 +178,14 @@ def parse_candles(payload: Any) -> list[Candle]:
     return sorted((candle for candle in candles if candle), key=lambda candle: candle.timestamp)
 
 
-def get_candles(session: requests.Session, pair: str) -> list[Candle]:
+def get_candles(session: requests.Session, pair: str, log_response: bool = False) -> list[Candle]:
     response = session.get(
         COINDCX_CANDLES_URL,
         params={"pair": pair, "interval": INTERVAL, "limit": CANDLE_LIMIT},
         timeout=REQUEST_TIMEOUT,
     )
+    if log_response:
+        LOGGER.info("%s candle response status=%s body=%s", pair, getattr(response, "status_code", "unknown"), getattr(response, "text", ""))
     response.raise_for_status()
     return parse_candles(response.json())
 
@@ -166,25 +195,84 @@ def get_closed_candles(candles: list[Candle]) -> list[Candle]:
     return [candle for candle in candles if candle.timestamp + INTERVAL_MS <= now_ms]
 
 
+def _mean(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _evaluate_at(pair: str, candles: list[Candle], index: int) -> SignalEvaluation:
+    if index < MIN_HISTORY:
+        return SignalEvaluation(None, "not_enough_history")
+
+    trigger = candles[index]
+    base = candles[index - BASE_LOOKBACK:index]
+    older = candles[index - MIN_HISTORY:index - BASE_LOOKBACK]
+    base_high = max(candle.high for candle in base)
+    base_low = min(candle.low for candle in base)
+    base_mid = (base_high + base_low) / 2
+    if base_mid <= 0 or (base_high - base_low) / base_mid > MAX_BASE_RANGE_PCT:
+        return SignalEvaluation(None, "base_not_flat")
+
+    base_volume = _mean([candle.volume for candle in base[-DEAD_VOLUME_LOOKBACK:]])
+    older_volume = _mean([candle.volume for candle in older[-OLDER_VOLUME_LOOKBACK:]])
+    if base_volume <= 0:
+        return SignalEvaluation(None, "base_volume_zero")
+    if older_volume > 0 and base_volume > older_volume * 0.8:
+        return SignalEvaluation(None, "base_volume_not_dead")
+
+    volume_ratio = trigger.volume / base_volume
+    if volume_ratio < MIN_VOLUME_SPIKE_RATIO:
+        return SignalEvaluation(None, "volume_spike_too_small")
+
+    candle_range = trigger.high - trigger.low
+    body = abs(trigger.close - trigger.open)
+    if candle_range <= 0 or body / candle_range < MIN_BODY_TO_RANGE_RATIO:
+        return SignalEvaluation(None, "trigger_body_too_weak")
+
+    if trigger.close > trigger.open and trigger.close > base_high:
+        extension = (trigger.close - base_high) / base_high
+        if extension > MAX_EXTENSION_FROM_BASE_PCT:
+            return SignalEvaluation(None, "move_overextended")
+        return SignalEvaluation(Signal(pair, "BUY", trigger, base_volume, volume_ratio, base_high))
+
+    if trigger.close < trigger.open and trigger.close < base_low:
+        extension = (base_low - trigger.close) / base_low
+        if extension > MAX_EXTENSION_FROM_BASE_PCT:
+            return SignalEvaluation(None, "move_overextended")
+        return SignalEvaluation(Signal(pair, "SELL", trigger, base_volume, volume_ratio, base_low))
+
+    return SignalEvaluation(None, "no_base_break")
+
+
+def evaluate_signal(pair: str, candles: list[Candle]) -> SignalEvaluation:
+    if len(candles) < MIN_HISTORY + 1:
+        return SignalEvaluation(None, "not_enough_history")
+    last_rejection = SignalEvaluation(None, "no_recent_photo_setup")
+    priority_rejection: SignalEvaluation | None = None
+    for index in range(len(candles) - 1, MIN_HISTORY - 1, -1):
+        evaluation = _evaluate_at(pair, candles, index)
+        if evaluation.signal is not None:
+            later = candles[index + 1:]
+            if len(later) > 5:
+                return SignalEvaluation(None, "move_already_extended")
+            return evaluation
+        if evaluation.rejection_reason == "volume_spike_too_small":
+            priority_rejection = evaluation
+        if index == len(candles) - 1:
+            last_rejection = evaluation
+    return priority_rejection or last_rejection
+
+
+def detect_signal(pair: str, candles: list[Candle]) -> Signal | None:
+    return evaluate_signal(pair, candles).signal
+
+
 def find_signal(pair: str, candles: list[Candle]) -> Signal | None:
     closed = get_closed_candles(candles)
-    if len(closed) < LOOKBACK + 1:
+    if len(closed) < MIN_HISTORY + 1:
         return None
-
-    latest = closed[-1]
-    previous = closed[-(LOOKBACK + 1):-1]
-    average_volume = sum(candle.volume for candle in previous) / LOOKBACK
-    if average_volume <= 0 or latest.volume < average_volume * VOLUME_MULTIPLIER:
-        return None
-
-    previous_high = max(candle.high for candle in previous)
-    previous_low = min(candle.low for candle in previous)
-
-    if latest.close > latest.open and latest.close > previous_high:
-        return Signal(pair, "BUY", latest, average_volume, latest.volume / average_volume, previous_high)
-    if latest.close < latest.open and latest.close < previous_low:
-        return Signal(pair, "SELL", latest, average_volume, latest.volume / average_volume, previous_low)
-    return None
+    # Live scanner alerts only when the newest closed candle is the first photo-style
+    # breakout/breakdown candle, preventing late/extra alerts after the move extends.
+    return _evaluate_at(pair, closed, len(closed) - 1).signal
 
 
 def format_alert(signal: Signal) -> str:
@@ -197,8 +285,7 @@ def format_alert(signal: Signal) -> str:
         f"Pair: {signal.pair}\n"
         f"Candle closed: {candle_close_time}\n"
         f"Close: {signal.candle.close:g}\n"
-        f"Volume: {signal.candle.volume:g} "
-        f"({signal.volume_ratio:.2f}x 20-candle average)\n"
+        f"Volume: {signal.candle.volume:g} ({signal.volume_ratio:.2f}x quiet-base average)\n"
         f"Break level: {signal.break_level:g}"
     )
 
@@ -224,7 +311,7 @@ def run() -> None:
     sent_alerts = load_state()
 
     pairs = get_usdt_pairs(session)
-    LOGGER.info("total USDT pairs found: %s", len(pairs))
+    LOGGER.info("total CoinDCX tradable USDT pairs found: %s", len(pairs))
 
     valid_candle_data = 0
     too_few_candles = 0
@@ -238,7 +325,7 @@ def run() -> None:
             LOGGER.warning("%s candle fetch failed: %s", pair, exc)
             continue
 
-        if len(get_closed_candles(candles)) < LOOKBACK + 1:
+        if len(get_closed_candles(candles)) < MIN_HISTORY + 1:
             too_few_candles += 1
             continue
 
@@ -260,12 +347,7 @@ def run() -> None:
     sell_count = sum(1 for signal in signals if signal.side == "SELL")
     LOGGER.info("pairs with valid candle data: %s", valid_candle_data)
     LOGGER.info("too_few_candles count: %s", too_few_candles)
-    LOGGER.info(
-        "valid BUY/SELL signals found: BUY=%s SELL=%s TOTAL=%s",
-        buy_count,
-        sell_count,
-        len(signals),
-    )
+    LOGGER.info("valid BUY/SELL signals found: BUY=%s SELL=%s TOTAL=%s", buy_count, sell_count, len(signals))
     LOGGER.info("Telegram alerts sent: %s", alerts_sent)
 
 
