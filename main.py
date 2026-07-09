@@ -7,6 +7,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+import re
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,7 @@ CANDLE_LIMIT = 80
 REQUEST_TIMEOUT = 20
 SCAN_SLEEP_SECONDS = float(os.getenv("SCAN_SLEEP_SECONDS", "0.15"))
 STATE_FILE = Path(os.getenv("STATE_FILE", ".alert_state.json"))
+ALERT_PAIR_NAMES: dict[str, str] = {}
 
 # Photo-style setup only: a quiet/flat base, then the first strong candle that
 # breaks out/breaks down with sudden volume expansion. No RSI/EMA/MACD/ATR/BB.
@@ -116,15 +118,25 @@ def save_state(sent_alerts: set[str]) -> None:
 
 
 def is_usdt_market(market: dict[str, Any]) -> bool:
-    values = [
-        market.get("base_currency_short_name"),
+    quote_values = [
         market.get("target_currency_short_name"),
         market.get("quote_currency_short_name"),
-        market.get("symbol"),
-        market.get("coindcx_name"),
-        market.get("pair"),
+        market.get("quote_currency"),
     ]
-    return any(str(value).upper().endswith("USDT") for value in values if value)
+    if any(str(value).upper() == "USDT" for value in quote_values if value):
+        return True
+
+    pair_name = str(market.get("coindcx_name") or market.get("symbol") or market.get("pair") or "").upper()
+    return pair_name.endswith("USDT") or pair_name.endswith("_USDT")
+
+
+def coindcx_alert_pair_name(market: dict[str, Any], pair: str) -> str:
+    name = str(market.get("coindcx_name") or market.get("symbol") or pair).upper()
+    return re.sub(r"^[A-Z]-", "", name).replace("_", "")
+
+
+def alert_pair_name(pair: str) -> str:
+    return ALERT_PAIR_NAMES.get(pair, re.sub(r"^[A-Z]-", "", pair.upper()).replace("_", ""))
 
 
 def get_usdt_pairs(session: requests.Session) -> list[str]:
@@ -138,7 +150,9 @@ def get_usdt_pairs(session: requests.Session) -> list[str]:
             continue
         status = str(market.get("status", "active")).lower()
         if status in {"active", "online"}:
-            pairs.add(str(pair))
+            pair_text = str(pair)
+            pairs.add(pair_text)
+            ALERT_PAIR_NAMES[pair_text] = coindcx_alert_pair_name(market, pair_text)
     return sorted(pairs)
 
 
@@ -246,20 +260,7 @@ def _evaluate_at(pair: str, candles: list[Candle], index: int) -> SignalEvaluati
 def evaluate_signal(pair: str, candles: list[Candle]) -> SignalEvaluation:
     if len(candles) < MIN_HISTORY + 1:
         return SignalEvaluation(None, "not_enough_history")
-    last_rejection = SignalEvaluation(None, "no_recent_photo_setup")
-    priority_rejection: SignalEvaluation | None = None
-    for index in range(len(candles) - 1, MIN_HISTORY - 1, -1):
-        evaluation = _evaluate_at(pair, candles, index)
-        if evaluation.signal is not None:
-            later = candles[index + 1:]
-            if len(later) > 5:
-                return SignalEvaluation(None, "move_already_extended")
-            return evaluation
-        if evaluation.rejection_reason == "volume_spike_too_small":
-            priority_rejection = evaluation
-        if index == len(candles) - 1:
-            last_rejection = evaluation
-    return priority_rejection or last_rejection
+    return _evaluate_at(pair, candles, len(candles) - 1)
 
 
 def detect_signal(pair: str, candles: list[Candle]) -> Signal | None:
@@ -282,7 +283,7 @@ def format_alert(signal: Signal) -> str:
     )
     return (
         f"CoinDCX 15m {signal.side} signal\n"
-        f"Pair: {signal.pair}\n"
+        f"Pair: {alert_pair_name(signal.pair)}\n"
         f"Candle closed: {candle_close_time}\n"
         f"Close: {signal.candle.close:g}\n"
         f"Volume: {signal.candle.volume:g} ({signal.volume_ratio:.2f}x quiet-base average)\n"
