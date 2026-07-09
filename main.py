@@ -32,9 +32,8 @@ DEAD_VOLUME_LOOKBACK = 8
 OLDER_VOLUME_LOOKBACK = 8
 MIN_HISTORY = BASE_LOOKBACK + OLDER_VOLUME_LOOKBACK
 MAX_BASE_RANGE_PCT = 0.035
-MIN_VOLUME_SPIKE_RATIO = 2.2
-MAX_EXTENSION_FROM_BASE_PCT = 0.08
-MIN_BODY_TO_RANGE_RATIO = 0.55
+MIN_VOLUME_SPIKE_RATIO = 2.0
+MIN_BODY_TO_RANGE_RATIO = 0.45
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -217,6 +216,7 @@ def _evaluate_at(pair: str, candles: list[Candle], index: int) -> SignalEvaluati
     if index < MIN_HISTORY:
         return SignalEvaluation(None, "not_enough_history")
 
+    # Dead/quiet-volume selection happens before any breakout/breakdown check.
     trigger = candles[index]
     base = candles[index - BASE_LOOKBACK:index]
     older = candles[index - MIN_HISTORY:index - BASE_LOOKBACK]
@@ -242,16 +242,12 @@ def _evaluate_at(pair: str, candles: list[Candle], index: int) -> SignalEvaluati
     if candle_range <= 0 or body / candle_range < MIN_BODY_TO_RANGE_RATIO:
         return SignalEvaluation(None, "trigger_body_too_weak")
 
-    if trigger.close > trigger.open and trigger.close > base_high:
-        extension = (trigger.close - base_high) / base_high
-        if extension > MAX_EXTENSION_FROM_BASE_PCT:
-            return SignalEvaluation(None, "move_overextended")
+    # Photo-style first break only: latest candle must start from the dead base
+    # and close beyond the recent high/low; opening past the level is extended.
+    if trigger.close > trigger.open and trigger.open <= base_high and trigger.close > base_high:
         return SignalEvaluation(Signal(pair, "BUY", trigger, base_volume, volume_ratio, base_high))
 
-    if trigger.close < trigger.open and trigger.close < base_low:
-        extension = (base_low - trigger.close) / base_low
-        if extension > MAX_EXTENSION_FROM_BASE_PCT:
-            return SignalEvaluation(None, "move_overextended")
+    if trigger.close < trigger.open and trigger.open >= base_low and trigger.close < base_low:
         return SignalEvaluation(Signal(pair, "SELL", trigger, base_volume, volume_ratio, base_low))
 
     return SignalEvaluation(None, "no_base_break")
