@@ -5,7 +5,8 @@ Telegram, or order-placement logic, and it does not import or modify the
 existing CoinDCX scanner.
 
 Configuration is read only from environment variables / GitHub Secrets:
-- FYERS_ACCESS_TOKEN: required FYERS API v3 access token, used directly.
+- FYERS_APP_ID: required FYERS API v3 app/client ID.
+- FYERS_ACCESS_TOKEN: required FYERS API v3 access token.
 - FYERS_DB_PATH: optional SQLite database path (default: fyers_ohlcv.sqlite3).
 - FYERS_SYMBOLS: optional comma-separated FYERS symbols. Defaults to a starter
   list of NSE F&O equity symbols such as NSE:RELIANCE-EQ.
@@ -64,6 +65,14 @@ class CollectionResult:
     requested_to: str
     fetched: int
     inserted_or_updated: int
+
+
+def get_app_id() -> str:
+    """Return the FYERS app/client ID without logging or transforming it."""
+    app_id = os.getenv("FYERS_APP_ID", "").strip()
+    if not app_id:
+        raise RuntimeError("FYERS_APP_ID environment variable is required")
+    return app_id
 
 
 def get_access_token() -> str:
@@ -145,12 +154,13 @@ def incremental_start_date(
     return latest_date
 
 
-def build_headers(access_token: str) -> dict[str, str]:
-    return {"Authorization": access_token}
+def build_headers(app_id: str, access_token: str) -> dict[str, str]:
+    return {"Authorization": f"{app_id}:{access_token}"}
 
 
 def fetch_history(
     session: requests.Session,
+    app_id: str,
     access_token: str,
     symbol: str,
     start_date: dt.date,
@@ -158,7 +168,7 @@ def fetch_history(
 ) -> list[FyersCandle]:
     response = session.get(
         FYERS_HISTORY_URL,
-        headers=build_headers(access_token),
+        headers=build_headers(app_id, access_token),
         params={
             "symbol": symbol,
             "resolution": RESOLUTION,
@@ -233,18 +243,20 @@ def store_candles(connection: sqlite3.Connection, candles: Iterable[FyersCandle]
 def collect_symbol(
     connection: sqlite3.Connection,
     session: requests.Session,
+    app_id: str,
     access_token: str,
     symbol: str,
     fallback_start: dt.date,
     end_date: dt.date,
 ) -> CollectionResult:
     start_date = incremental_start_date(connection, symbol, fallback_start)
-    candles = fetch_history(session, access_token, symbol, start_date, end_date)
+    candles = fetch_history(session, app_id, access_token, symbol, start_date, end_date)
     affected = store_candles(connection, candles)
     return CollectionResult(symbol, start_date.isoformat(), end_date.isoformat(), len(candles), affected)
 
 
 def collect_all() -> list[CollectionResult]:
+    app_id = get_app_id()
     token = get_access_token()
     start_date, end_date = configured_date_range()
     sleep_seconds = float(os.getenv("FYERS_SLEEP_SECONDS", "0.2"))
@@ -252,7 +264,7 @@ def collect_all() -> list[CollectionResult]:
 
     with connect_database() as connection, requests.Session() as session:
         for symbol in configured_symbols():
-            result = collect_symbol(connection, session, token, symbol, start_date, end_date)
+            result = collect_symbol(connection, session, app_id, token, symbol, start_date, end_date)
             LOGGER.info(
                 "Collected %s candles for %s from %s to %s",
                 result.fetched,
