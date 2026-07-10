@@ -1,0 +1,30 @@
+name: FYERS Authorization URL Generator
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  generate-authorization-url:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirement.txt
+
+      - name: Generate FYERS authorization URL
+        env:
+          FYERS_APP_ID: ${{ secrets.FYERS_APP_ID }}
+          FYERS_SECRET_KEY: ${{ secrets.FYERS_SECRET_KEY }}
+          FYERS_REDIRECT_URI: ${{ secrets.FYERS_REDIRECT_URI }}
+        run: python fyers_access_token_generator.py
