@@ -10,9 +10,18 @@ from fyers_data_collector import FyersCandle
 
 
 class FyersDataCollectorTests(unittest.TestCase):
+    def test_app_id_is_read_directly_from_environment(self) -> None:
+        with patch.dict(os.environ, {"FYERS_APP_ID": "APP-100"}, clear=True):
+            self.assertEqual(collector.get_app_id(), "APP-100")
+
     def test_access_token_is_read_directly_from_environment(self) -> None:
-        with patch.dict(os.environ, {"FYERS_ACCESS_TOKEN": "app-id:secret-token"}, clear=True):
-            self.assertEqual(collector.get_access_token(), "app-id:secret-token")
+        with patch.dict(os.environ, {"FYERS_ACCESS_TOKEN": "secret-token"}, clear=True):
+            self.assertEqual(collector.get_access_token(), "secret-token")
+
+    def test_missing_app_id_raises_without_value(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "FYERS_APP_ID"):
+                collector.get_app_id()
 
     def test_missing_access_token_raises_without_value(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
@@ -56,7 +65,7 @@ class FyersDataCollectorTests(unittest.TestCase):
 
         self.assertEqual(start, dt.date(2024, 1, 1))
 
-    def test_fetch_history_uses_fyers_v3_history_parameters_and_token_header(self) -> None:
+    def test_fetch_history_uses_fyers_v3_history_parameters_and_app_token_header(self) -> None:
         class Response:
             def raise_for_status(self) -> None:
                 return None
@@ -75,6 +84,7 @@ class FyersDataCollectorTests(unittest.TestCase):
         session = Session()
         candles = collector.fetch_history(
             session,
+            "APP-100",
             "direct-token",
             "NSE:SBIN-EQ",
             dt.date(2024, 1, 1),
@@ -82,7 +92,7 @@ class FyersDataCollectorTests(unittest.TestCase):
         )
 
         self.assertEqual(session.url, collector.FYERS_HISTORY_URL)
-        self.assertEqual(session.headers["Authorization"], "direct-token")
+        self.assertEqual(session.headers["Authorization"], "APP-100:direct-token")
         self.assertEqual(session.params["symbol"], "NSE:SBIN-EQ")
         self.assertEqual(session.params["resolution"], "5")
         self.assertEqual(session.params["date_format"], "1")
