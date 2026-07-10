@@ -63,6 +63,37 @@ class FyersAccessTokenGeneratorTests(unittest.TestCase):
         self.assertEqual(payload["code"], "auth-code-value")
         self.assertNotIn("secret", str(payload))
 
+    @patch("fyers_access_token_generator.exchange_auth_code")
+    def test_main_without_redirected_url_prints_login_url_only(self, exchange: Mock) -> None:
+        env = {
+            "FYERS_APP_ID": "APP-100",
+            "FYERS_SECRET_KEY": "secret",
+            "FYERS_REDIRECT_URI": "https://example.com/callback",
+        }
+        with patch.dict(os.environ, env, clear=True), patch("builtins.print") as printed:
+            exit_code = generator.main()
+
+        self.assertEqual(exit_code, 0)
+        exchange.assert_not_called()
+        printed.assert_called_once()
+        self.assertIn(generator.FYERS_AUTH_URL, printed.call_args.args[0])
+
+    @patch("fyers_access_token_generator.exchange_auth_code", return_value="APP-100:token")
+    def test_main_with_redirected_url_exchanges_and_prints_token_once(self, exchange: Mock) -> None:
+        env = {
+            "FYERS_APP_ID": "APP-100",
+            "FYERS_SECRET_KEY": "secret",
+            "FYERS_REDIRECT_URI": "https://example.com/callback",
+            "FYERS_REDIRECTED_URL": "https://example.com/callback?auth_code=abc123",
+        }
+        with patch.dict(os.environ, env, clear=True), patch("builtins.print") as printed:
+            exit_code = generator.main()
+
+        self.assertEqual(exit_code, 0)
+        exchange.assert_called_once()
+        self.assertEqual(exchange.call_args.args[1], "abc123")
+        printed.assert_called_once_with("APP-100:token")
+
 
 if __name__ == "__main__":
     unittest.main()

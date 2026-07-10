@@ -106,11 +106,19 @@ def exchange_auth_code(credentials: FyersCredentials, auth_code: str) -> str:
     return access_token
 
 
+def read_redirected_url() -> str:
+    """Read the FYERS redirected URL from the environment when provided."""
+    return os.getenv("FYERS_REDIRECTED_URL", "").strip()
+
+
 def main() -> int:
     try:
         credentials = read_credentials()
-        print(build_login_url(credentials), flush=True)
-        redirected_url = input("Paste the full redirected URL here: ").strip()
+        redirected_url = read_redirected_url()
+        if not redirected_url:
+            print(build_login_url(credentials), flush=True)
+            return 0
+
         auth_code = extract_auth_code(redirected_url)
         access_token = exchange_auth_code(credentials, auth_code)
         print(access_token)
