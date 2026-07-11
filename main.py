@@ -399,7 +399,7 @@ def run() -> None:
                 continue
 
             latest_base = find_latest_sideways_base(pair, base_candles)
-            if latest_base and (pair not in setups or latest_base.base_end_timestamp > setups[pair].base_end_timestamp):
+            if latest_base and pair not in setups:
                 setups[pair] = latest_base
 
             setup = setups.get(pair)
