@@ -191,6 +191,62 @@ class ImmediateFifteenMinuteTriggerTests(unittest.TestCase):
         self.assertIsNone(evaluation.signal)
         self.assertEqual(evaluation.rejection_reason, "volume_spike_too_small")
 
+
+    def test_previous_candle_volume_is_ignored_for_trigger_reference(self) -> None:
+        setup = self.latest_base()
+        previous = candle(100, 100.2, 99.9, 100.1, 10_000, self.now_ms - 900_000)
+        trigger = candle(100, 100.7, 99.9, 100.2, setup.reference_volume * 2.99, self.now_ms)
+
+        self.assertGreater(trigger.volume, previous.volume / 100)
+        evaluation = evaluate_trigger("PREVIOUSUSDT", setup, trigger, self.now_ms)
+
+        self.assertIsNone(evaluation.signal)
+        self.assertEqual(evaluation.rejection_reason, "volume_spike_too_small")
+
+    def test_saved_sideways_base_average_volume_is_used_for_trigger_ratio(self) -> None:
+        setup = self.latest_base()
+        trigger = candle(100, 100.7, 99.9, 100.2, 151.5, self.now_ms)
+
+        signal = evaluate_trigger("AVERAGEUSDT", setup, trigger, self.now_ms).signal
+
+        self.assertIsNotNone(signal)
+        self.assertAlmostEqual(setup.reference_volume, 50.5)
+        self.assertAlmostEqual(signal.volume_ratio, 3.0)
+
+    def test_existing_setup_reference_volume_is_not_replaced_by_later_base_average(self) -> None:
+        setup = self.latest_base()
+        later_start = setup.base_end_timestamp + 900_000
+        later_base = [
+            candle(100 + (index % 2) * 0.03, 100.4, 99.8, 100.01, 80 + (index % 2), later_start + index * 900_000)
+            for index in range(12)
+        ]
+        with patch("main.time.time", return_value=(later_base[-1].timestamp + 900_000) / 1000):
+            later_setup = find_latest_sideways_base("BLURUSDT", later_base)
+
+        self.assertIsNotNone(later_setup)
+        self.assertAlmostEqual(setup.reference_volume, 50.5)
+        self.assertAlmostEqual(later_setup.reference_volume, 80.5)
+
+        setups = {"BLURUSDT": setup}
+        if later_setup and "BLURUSDT" not in setups:
+            setups["BLURUSDT"] = later_setup
+
+        self.assertIs(setups["BLURUSDT"], setup)
+        self.assertAlmostEqual(setups["BLURUSDT"].reference_volume, 50.5)
+
+    def test_alert_requires_trigger_volume_at_least_3x_saved_sideways_average(self) -> None:
+        setup = self.latest_base()
+        too_small = candle(100, 100.7, 99.9, 100.2, setup.reference_volume * 3 - 0.01, self.now_ms)
+        exact = candle(100, 100.7, 99.9, 100.2, setup.reference_volume * 3, self.now_ms)
+
+        rejected = evaluate_trigger("THRESHOLDUSDT", setup, too_small, self.now_ms)
+        accepted = evaluate_trigger("THRESHOLDUSDT", setup, exact, self.now_ms)
+
+        self.assertIsNone(rejected.signal)
+        self.assertEqual(rejected.rejection_reason, "volume_spike_too_small")
+        self.assertIsNotNone(accepted.signal)
+        self.assertAlmostEqual(accepted.signal.volume_ratio, 3.0)
+
     def test_missed_scan_recovery_alerts_when_next_scan_price_still_beyond_original_high(self) -> None:
         setup = self.latest_base()
         later_latest = candle(100.7, 100.9, 100.55, 100.58, setup.reference_volume * 3.2, self.now_ms + 60_000)
