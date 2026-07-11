@@ -18,7 +18,7 @@ COINDCX_CANDLES_URL = "https://public.coindcx.com/market_data/candles"
 TELEGRAM_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
 BASE_INTERVAL = "15m"
-TRIGGER_INTERVAL = "5m"
+TRIGGER_INTERVAL = "1m"
 BASE_INTERVAL_MS = 15 * 60 * 1000
 TRIGGER_INTERVAL_MS = 5 * 60 * 1000
 PAIR_REFRESH_SECONDS = 30 * 60
@@ -159,13 +159,16 @@ def coindcx_alert_pair_name(market: dict[str, Any], pair: str) -> str:
 
 
 def coindcx_candle_pair_name(market: dict[str, Any]) -> str | None:
-    """Return the market identifier used by the public candles endpoint."""
-    for field in ("coindcx_name", "symbol", "pair"):
+    """Return the exact market metadata pair used by the public candles endpoint."""
+    pair = market.get("pair")
+    if pair:
+        return str(pair).upper()
+    for field in ("coindcx_name", "symbol"):
         value = market.get(field)
         if value:
-            pair = re.sub(r"^[A-Z]-", "", str(value).upper()).replace("_", "")
-            if pair:
-                return pair
+            pair_text = str(value).upper()
+            if pair_text:
+                return pair_text
     return None
 
 
@@ -246,6 +249,30 @@ def get_candles(session: requests.Session, pair: str, interval: str = BASE_INTER
 def get_closed_candles(candles: list[Candle], interval_ms: int = BASE_INTERVAL_MS) -> list[Candle]:
     now_ms = int(time.time() * 1000)
     return [candle for candle in candles if candle.timestamp + interval_ms <= now_ms]
+
+
+def build_running_5m_candle(one_minute_candles: list[Candle], now_ms: int | None = None) -> Candle | None:
+    """Aggregate available 1m candles in the current exchange-aligned 5m block."""
+    if not one_minute_candles:
+        return None
+    latest_timestamp = one_minute_candles[-1].timestamp if now_ms is None else now_ms
+    block_start = (latest_timestamp // TRIGGER_INTERVAL_MS) * TRIGGER_INTERVAL_MS
+    block_end = block_start + TRIGGER_INTERVAL_MS
+    current_block = [
+        candle
+        for candle in sorted(one_minute_candles, key=lambda item: item.timestamp)
+        if block_start <= candle.timestamp < block_end
+    ]
+    if not current_block:
+        return None
+    return Candle(
+        timestamp=block_start,
+        open=current_block[0].open,
+        high=max(candle.high for candle in current_block),
+        low=min(candle.low for candle in current_block),
+        close=current_block[-1].close,
+        volume=sum(candle.volume for candle in current_block),
+    )
 
 
 def _mean(values: list[float]) -> float:
@@ -416,12 +443,13 @@ def run() -> None:
                     remember_invalid_candle_pair(pair, TRIGGER_INTERVAL)
                     setups.pop(pair, None)
                 else:
-                    LOGGER.warning("%s 5m candle fetch failed: %s", pair, exc)
+                    LOGGER.warning("%s 1m candle fetch for running 5m aggregation failed: %s", pair, exc)
                 continue
-            if not trigger_candles:
+            running_5m_candle = build_running_5m_candle(trigger_candles, now_ms)
+            if running_5m_candle is None:
                 continue
 
-            evaluation = evaluate_trigger(pair, setup, trigger_candles[-1], now_ms)
+            evaluation = evaluate_trigger(pair, setup, running_5m_candle, now_ms)
             signal = evaluation.signal
             if signal is not None:
                 signals.append(signal)
