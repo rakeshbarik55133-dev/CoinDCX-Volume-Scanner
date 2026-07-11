@@ -11,6 +11,7 @@ from main import (
     TRIGGER_INTERVAL,
     BaseSetup,
     Candle,
+    build_running_5m_candle,
     detect_signal,
     evaluate_signal,
     evaluate_trigger,
@@ -44,8 +45,8 @@ class CoinDCXCandleFetchTests(unittest.TestCase):
             def get(self, *args, **kwargs) -> Response:
                 return Response()
 
-        self.assertEqual(get_usdt_pairs(Session()), ["BTCUSDT"])
-        self.assertEqual(main.ALERT_PAIR_NAMES["BTCUSDT"], "BTCUSDT")
+        self.assertEqual(get_usdt_pairs(Session()), ["B-BTC_USDT"])
+        self.assertEqual(main.ALERT_PAIR_NAMES["B-BTC_USDT"], "BTCUSDT")
 
     def test_get_usdt_pairs_uses_candles_endpoint_symbol_and_skips_cached_invalid_pair(self) -> None:
         class Response:
@@ -62,8 +63,8 @@ class CoinDCXCandleFetchTests(unittest.TestCase):
             def get(self, *args, **kwargs) -> Response:
                 return Response()
 
-        with patch.object(main, "INVALID_CANDLE_PAIRS", {"1000CHEEMSUSDT"}), patch.object(main, "ALERT_PAIR_NAMES", {}):
-            self.assertEqual(get_usdt_pairs(Session()), ["BTCUSDT"])
+        with patch.object(main, "INVALID_CANDLE_PAIRS", {"B-1000CHEEMS_USDT"}), patch.object(main, "ALERT_PAIR_NAMES", {}):
+            self.assertEqual(get_usdt_pairs(Session()), ["B-BTC_USDT"])
 
     def test_remember_invalid_candle_pair_logs_once_and_caches_pair(self) -> None:
         with patch.object(main, "INVALID_CANDLE_PAIRS", set()), patch.object(main, "LOGGED_INVALID_CANDLE_PAIRS", set()):
@@ -117,7 +118,7 @@ class CoinDCXCandleFetchTests(unittest.TestCase):
         candles = get_candles(session, "B-BTC_USDT", TRIGGER_INTERVAL)
 
         self.assertEqual(session.params["pair"], "B-BTC_USDT")
-        self.assertEqual(session.params["interval"], "5m")
+        self.assertEqual(session.params["interval"], "1m")
         self.assertEqual([item.timestamp for item in candles], [1000, 2000])
         self.assertEqual(candles[0].close, 1.5)
 
@@ -141,6 +142,31 @@ class CoinDCXCandleFetchTests(unittest.TestCase):
 
         self.assertIn("15m candle response", logs.output[0])
         self.assertIn("status=200", logs.output[0])
+
+    def test_build_running_5m_candle_aggregates_partial_current_block(self) -> None:
+        block_start = 1_700_020_200_000
+        source = [
+            candle(99, 101, 98, 100, 7, block_start - 60_000),
+            candle(100, 101, 99.5, 100.5, 10, block_start),
+            candle(100.5, 102, 100, 101.5, 11, block_start + 60_000),
+            candle(101.5, 103, 100.5, 102.5, 12, block_start + 120_000),
+            candle(102.5, 104, 101, 103.5, 13, block_start + 180_000),
+            candle(103.5, 105, 102, 104.5, 14, block_start + 240_000),
+            candle(104.5, 106, 103, 105.5, 15, block_start + 300_000),
+        ]
+
+        expected = [
+            (1, 100, 101, 99.5, 100.5, 10),
+            (2, 100, 102, 99.5, 101.5, 21),
+            (3, 100, 103, 99.5, 102.5, 33),
+            (4, 100, 104, 99.5, 103.5, 46),
+            (5, 100, 105, 99.5, 104.5, 60),
+        ]
+        for count, open_price, high, low, close, volume in expected:
+            with self.subTest(one_minute_candles=count):
+                running = build_running_5m_candle(source[: count + 1], block_start + (count - 1) * 60_000)
+                self.assertIsNotNone(running)
+                self.assertEqual(running, candle(open_price, high, low, close, volume, block_start))
 
 
 class ImmediateFiveMinuteTriggerTests(unittest.TestCase):
