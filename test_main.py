@@ -3,6 +3,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import requests
+
 import main
 from main import (
     BASE_INTERVAL,
@@ -15,6 +17,7 @@ from main import (
     find_latest_sideways_base,
     get_candles,
     get_usdt_pairs,
+    remember_invalid_candle_pair,
     load_state,
     save_state,
 )
@@ -41,7 +44,53 @@ class CoinDCXCandleFetchTests(unittest.TestCase):
             def get(self, *args, **kwargs) -> Response:
                 return Response()
 
-        self.assertEqual(get_usdt_pairs(Session()), ["B-BTC_USDT"])
+        self.assertEqual(get_usdt_pairs(Session()), ["BTCUSDT"])
+        self.assertEqual(main.ALERT_PAIR_NAMES["BTCUSDT"], "BTCUSDT")
+
+    def test_get_usdt_pairs_uses_candles_endpoint_symbol_and_skips_cached_invalid_pair(self) -> None:
+        class Response:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> list[dict[str, str]]:
+                return [
+                    {"coindcx_name": "1000CHEEMSUSDT", "target_currency_short_name": "USDT", "pair": "B-1000CHEEMS_USDT", "status": "active"},
+                    {"coindcx_name": "BTCUSDT", "target_currency_short_name": "USDT", "pair": "B-BTC_USDT", "status": "active"},
+                ]
+
+        class Session:
+            def get(self, *args, **kwargs) -> Response:
+                return Response()
+
+        with patch.object(main, "INVALID_CANDLE_PAIRS", {"1000CHEEMSUSDT"}), patch.object(main, "ALERT_PAIR_NAMES", {}):
+            self.assertEqual(get_usdt_pairs(Session()), ["BTCUSDT"])
+
+    def test_remember_invalid_candle_pair_logs_once_and_caches_pair(self) -> None:
+        with patch.object(main, "INVALID_CANDLE_PAIRS", set()), patch.object(main, "LOGGED_INVALID_CANDLE_PAIRS", set()):
+            with self.assertLogs("main", level="WARNING") as logs:
+                remember_invalid_candle_pair("ARBUSDT", TRIGGER_INTERVAL)
+                remember_invalid_candle_pair("ARBUSDT", TRIGGER_INTERVAL)
+
+            self.assertEqual(main.INVALID_CANDLE_PAIRS, {"ARBUSDT"})
+            self.assertEqual(len(logs.output), 1)
+            self.assertIn("excluding for the rest of this run", logs.output[0])
+
+    def test_get_candles_propagates_422_with_response_for_invalid_pair_cache(self) -> None:
+        class Response:
+            status_code = 422
+            text = "invalid pair"
+
+            def raise_for_status(self) -> None:
+                raise requests.HTTPError("422 Client Error", response=self)
+
+        class Session:
+            def get(self, _url, params, timeout) -> Response:
+                return Response()
+
+        with self.assertRaises(requests.HTTPError) as raised:
+            get_candles(Session(), "B-ARB_USDT", TRIGGER_INTERVAL)
+
+        self.assertEqual(raised.exception.response.status_code, 422)
 
     def test_get_candles_parses_descending_api_candles_chronologically_and_interval(self) -> None:
         class Response:

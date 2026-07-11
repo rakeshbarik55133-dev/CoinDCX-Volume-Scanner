@@ -27,6 +27,8 @@ REQUEST_TIMEOUT = 20
 SCAN_SLEEP_SECONDS = float(os.getenv("SCAN_SLEEP_SECONDS", "0.15"))
 STATE_FILE = Path(os.getenv("STATE_FILE", ".alert_state.json"))
 ALERT_PAIR_NAMES: dict[str, str] = {}
+INVALID_CANDLE_PAIRS: set[str] = set()
+LOGGED_INVALID_CANDLE_PAIRS: set[str] = set()
 
 # Sideways-base detection. These are intentionally limited to base shape and
 # base volume only; no indicators, ranking, confirmation candles, or late-entry
@@ -156,6 +158,17 @@ def coindcx_alert_pair_name(market: dict[str, Any], pair: str) -> str:
     return re.sub(r"^[A-Z]-", "", name).replace("_", "")
 
 
+def coindcx_candle_pair_name(market: dict[str, Any]) -> str | None:
+    """Return the market identifier used by the public candles endpoint."""
+    for field in ("coindcx_name", "symbol", "pair"):
+        value = market.get(field)
+        if value:
+            pair = re.sub(r"^[A-Z]-", "", str(value).upper()).replace("_", "")
+            if pair:
+                return pair
+    return None
+
+
 def alert_pair_name(pair: str) -> str:
     return ALERT_PAIR_NAMES.get(pair, re.sub(r"^[A-Z]-", "", pair.upper()).replace("_", ""))
 
@@ -170,9 +183,11 @@ def get_usdt_pairs(session: requests.Session) -> list[str]:
             continue
         status = str(market.get("status", "active")).lower()
         if status in {"active", "online"}:
-            pair_text = str(pair)
+            pair_text = coindcx_candle_pair_name(market)
+            if pair_text is None or pair_text in INVALID_CANDLE_PAIRS:
+                continue
             pairs.add(pair_text)
-            ALERT_PAIR_NAMES[pair_text] = coindcx_alert_pair_name(market, pair_text)
+            ALERT_PAIR_NAMES[pair_text] = coindcx_alert_pair_name(market, str(pair))
     return sorted(pairs)
 
 
@@ -201,6 +216,19 @@ def parse_candles(payload: Any) -> list[Candle]:
         raw_candles = []
     candles = [normalize_candle(item) for item in raw_candles if isinstance(item, (dict, list))]
     return sorted((candle for candle in candles if candle), key=lambda candle: candle.timestamp)
+
+
+def is_http_422(exc: requests.RequestException) -> bool:
+    response = getattr(exc, "response", None)
+    return getattr(response, "status_code", None) == 422
+
+
+def remember_invalid_candle_pair(pair: str, interval: str) -> None:
+    INVALID_CANDLE_PAIRS.add(pair)
+    if pair in LOGGED_INVALID_CANDLE_PAIRS:
+        return
+    LOGGED_INVALID_CANDLE_PAIRS.add(pair)
+    LOGGER.warning("%s candle endpoint returned HTTP 422 for %s; excluding for the rest of this run", pair, interval)
 
 
 def get_candles(session: requests.Session, pair: str, interval: str = BASE_INTERVAL, log_response: bool = False) -> list[Candle]:
@@ -357,10 +385,15 @@ def run() -> None:
         now_ms = int(time.time() * 1000)
 
         for pair in pairs:
+            if pair in INVALID_CANDLE_PAIRS:
+                continue
             try:
                 base_candles = get_candles(session, pair, BASE_INTERVAL)
             except requests.RequestException as exc:
-                LOGGER.warning("%s 15m candle fetch failed: %s", pair, exc)
+                if is_http_422(exc):
+                    remember_invalid_candle_pair(pair, BASE_INTERVAL)
+                else:
+                    LOGGER.warning("%s 15m candle fetch failed: %s", pair, exc)
                 continue
 
             latest_base = find_latest_sideways_base(pair, base_candles)
@@ -379,7 +412,11 @@ def run() -> None:
             try:
                 trigger_candles = get_candles(session, pair, TRIGGER_INTERVAL)
             except requests.RequestException as exc:
-                LOGGER.warning("%s 5m candle fetch failed: %s", pair, exc)
+                if is_http_422(exc):
+                    remember_invalid_candle_pair(pair, TRIGGER_INTERVAL)
+                    setups.pop(pair, None)
+                else:
+                    LOGGER.warning("%s 5m candle fetch failed: %s", pair, exc)
                 continue
             if not trigger_candles:
                 continue
