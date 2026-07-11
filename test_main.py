@@ -11,7 +11,6 @@ from main import (
     TRIGGER_INTERVAL,
     BaseSetup,
     Candle,
-    build_running_5m_candle,
     detect_signal,
     evaluate_signal,
     evaluate_trigger,
@@ -118,7 +117,7 @@ class CoinDCXCandleFetchTests(unittest.TestCase):
         candles = get_candles(session, "B-BTC_USDT", TRIGGER_INTERVAL)
 
         self.assertEqual(session.params["pair"], "B-BTC_USDT")
-        self.assertEqual(session.params["interval"], "1m")
+        self.assertEqual(session.params["interval"], "15m")
         self.assertEqual([item.timestamp for item in candles], [1000, 2000])
         self.assertEqual(candles[0].close, 1.5)
 
@@ -143,33 +142,9 @@ class CoinDCXCandleFetchTests(unittest.TestCase):
         self.assertIn("15m candle response", logs.output[0])
         self.assertIn("status=200", logs.output[0])
 
-    def test_build_running_5m_candle_aggregates_partial_current_block(self) -> None:
-        block_start = 1_700_020_200_000
-        source = [
-            candle(99, 101, 98, 100, 7, block_start - 60_000),
-            candle(100, 101, 99.5, 100.5, 10, block_start),
-            candle(100.5, 102, 100, 101.5, 11, block_start + 60_000),
-            candle(101.5, 103, 100.5, 102.5, 12, block_start + 120_000),
-            candle(102.5, 104, 101, 103.5, 13, block_start + 180_000),
-            candle(103.5, 105, 102, 104.5, 14, block_start + 240_000),
-            candle(104.5, 106, 103, 105.5, 15, block_start + 300_000),
-        ]
-
-        expected = [
-            (1, 100, 101, 99.5, 100.5, 10),
-            (2, 100, 102, 99.5, 101.5, 21),
-            (3, 100, 103, 99.5, 102.5, 33),
-            (4, 100, 104, 99.5, 103.5, 46),
-            (5, 100, 105, 99.5, 104.5, 60),
-        ]
-        for count, open_price, high, low, close, volume in expected:
-            with self.subTest(one_minute_candles=count):
-                running = build_running_5m_candle(source[: count + 1], block_start + (count - 1) * 60_000)
-                self.assertIsNotNone(running)
-                self.assertEqual(running, candle(open_price, high, low, close, volume, block_start))
 
 
-class ImmediateFiveMinuteTriggerTests(unittest.TestCase):
+class ImmediateFifteenMinuteTriggerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.now_ms = 1_700_020_000_000
 
@@ -193,47 +168,47 @@ class ImmediateFiveMinuteTriggerTests(unittest.TestCase):
         self.assertEqual(setup.base_low, 99.75)
         self.assertAlmostEqual(setup.reference_volume, 50.5)
 
-    def test_buy_alerts_on_running_5m_high_break_and_3x_original_volume_without_close_wait(self) -> None:
+    def test_buy_alerts_on_latest_15m_high_break_and_3x_original_volume_without_close_wait(self) -> None:
         setup = self.latest_base()
-        running = candle(100.0, 100.6, 99.9, 100.2, setup.reference_volume * 3, self.now_ms)
-        signal = evaluate_trigger("BLURUSDT", setup, running, self.now_ms).signal
+        latest = candle(100.0, 100.6, 99.9, 100.2, setup.reference_volume * 3, self.now_ms)
+        signal = evaluate_trigger("BLURUSDT", setup, latest, self.now_ms).signal
         self.assertIsNotNone(signal)
         self.assertEqual(signal.side, "BUY")
         self.assertEqual(signal.break_level, setup.base_high)
 
-    def test_sell_alerts_on_running_5m_low_break_and_3x_original_volume_without_close_wait(self) -> None:
+    def test_sell_alerts_on_latest_15m_low_break_and_3x_original_volume_without_close_wait(self) -> None:
         setup = self.latest_base()
-        running = candle(100.0, 100.1, 99.5, 99.9, setup.reference_volume * 3, self.now_ms)
-        signal = evaluate_trigger("MUSDT", setup, running, self.now_ms).signal
+        latest = candle(100.0, 100.1, 99.5, 99.9, setup.reference_volume * 3, self.now_ms)
+        signal = evaluate_trigger("MUSDT", setup, latest, self.now_ms).signal
         self.assertIsNotNone(signal)
         self.assertEqual(signal.side, "SELL")
         self.assertEqual(signal.break_level, setup.base_low)
 
-    def test_rejects_break_when_running_volume_is_less_than_3x_reference(self) -> None:
+    def test_rejects_break_when_latest_15m_volume_is_less_than_3x_reference(self) -> None:
         setup = self.latest_base()
-        running = candle(100.0, 101.0, 99.9, 100.8, setup.reference_volume * 2.99, self.now_ms)
-        evaluation = evaluate_trigger("NOSPIKEUSDT", setup, running, self.now_ms)
+        latest = candle(100.0, 101.0, 99.9, 100.8, setup.reference_volume * 2.99, self.now_ms)
+        evaluation = evaluate_trigger("NOSPIKEUSDT", setup, latest, self.now_ms)
         self.assertIsNone(evaluation.signal)
         self.assertEqual(evaluation.rejection_reason, "volume_spike_too_small")
 
     def test_missed_scan_recovery_alerts_when_next_scan_price_still_beyond_original_high(self) -> None:
         setup = self.latest_base()
-        later_running = candle(100.7, 100.9, 100.55, 100.58, setup.reference_volume * 3.2, self.now_ms + 60_000)
-        signal = evaluate_trigger("RECOVERYUSDT", setup, later_running, self.now_ms + 60_000).signal
+        later_latest = candle(100.7, 100.9, 100.55, 100.58, setup.reference_volume * 3.2, self.now_ms + 60_000)
+        signal = evaluate_trigger("RECOVERYUSDT", setup, later_latest, self.now_ms + 60_000).signal
         self.assertIsNotNone(signal)
         self.assertEqual(signal.side, "BUY")
         self.assertEqual(signal.setup.base_high, 100.45)
 
     def test_later_candles_do_not_replace_original_base_values_inside_existing_setup(self) -> None:
         setup = self.latest_base()
-        later_running = candle(104, 105, 103, 104.5, setup.reference_volume * 4, self.now_ms)
-        signal = evaluate_trigger("ORIGINALUSDT", setup, later_running, self.now_ms).signal
+        later_latest = candle(104, 105, 103, 104.5, setup.reference_volume * 4, self.now_ms)
+        signal = evaluate_trigger("ORIGINALUSDT", setup, later_latest, self.now_ms).signal
         self.assertIsNotNone(signal)
         self.assertEqual(signal.setup.base_high, 100.45)
         self.assertEqual(signal.setup.base_low, 99.75)
         self.assertAlmostEqual(signal.setup.reference_volume, 50.5)
 
-    def test_detect_signal_uses_15m_base_and_latest_running_5m_candle_only(self) -> None:
+    def test_detect_signal_uses_15m_base_and_latest_15m_candle_only(self) -> None:
         trigger = [candle(100, 100.2, 99.9, 100.1, 10, self.now_ms - 300_000), candle(100, 100.7, 99.9, 100.3, 200, self.now_ms)]
         with patch("main.time.time", return_value=self.now_ms / 1000):
             signal = detect_signal("FASTUSDT", self.base_candles(), trigger)
@@ -260,8 +235,8 @@ class ImmediateFiveMinuteTriggerTests(unittest.TestCase):
 
     def test_setup_expires(self) -> None:
         setup = self.latest_base()
-        running = candle(100, 101, 99, 100.8, setup.reference_volume * 4, setup.expires_at + 1)
-        evaluation = evaluate_trigger("EXPIREUSDT", setup, running, setup.expires_at + 1)
+        latest = candle(100, 101, 99, 100.8, setup.reference_volume * 4, setup.expires_at + 1)
+        evaluation = evaluate_trigger("EXPIREUSDT", setup, latest, setup.expires_at + 1)
         self.assertIsNone(evaluation.signal)
         self.assertEqual(evaluation.rejection_reason, "setup_expired")
 

@@ -1,4 +1,4 @@
-"""CoinDCX USDT sideways-base 5-minute running breakout Telegram scanner."""
+"""CoinDCX USDT sideways-base 15-minute breakout Telegram scanner."""
 
 from __future__ import annotations
 
@@ -18,9 +18,8 @@ COINDCX_CANDLES_URL = "https://public.coindcx.com/market_data/candles"
 TELEGRAM_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
 BASE_INTERVAL = "15m"
-TRIGGER_INTERVAL = "1m"
+TRIGGER_INTERVAL = BASE_INTERVAL
 BASE_INTERVAL_MS = 15 * 60 * 1000
-TRIGGER_INTERVAL_MS = 5 * 60 * 1000
 PAIR_REFRESH_SECONDS = 30 * 60
 CANDLE_LIMIT = 120
 REQUEST_TIMEOUT = 20
@@ -251,30 +250,6 @@ def get_closed_candles(candles: list[Candle], interval_ms: int = BASE_INTERVAL_M
     return [candle for candle in candles if candle.timestamp + interval_ms <= now_ms]
 
 
-def build_running_5m_candle(one_minute_candles: list[Candle], now_ms: int | None = None) -> Candle | None:
-    """Aggregate available 1m candles in the current exchange-aligned 5m block."""
-    if not one_minute_candles:
-        return None
-    latest_timestamp = one_minute_candles[-1].timestamp if now_ms is None else now_ms
-    block_start = (latest_timestamp // TRIGGER_INTERVAL_MS) * TRIGGER_INTERVAL_MS
-    block_end = block_start + TRIGGER_INTERVAL_MS
-    current_block = [
-        candle
-        for candle in sorted(one_minute_candles, key=lambda item: item.timestamp)
-        if block_start <= candle.timestamp < block_end
-    ]
-    if not current_block:
-        return None
-    return Candle(
-        timestamp=block_start,
-        open=current_block[0].open,
-        high=max(candle.high for candle in current_block),
-        low=min(candle.low for candle in current_block),
-        close=current_block[-1].close,
-        volume=sum(candle.volume for candle in current_block),
-    )
-
-
 def _mean(values: list[float]) -> float:
     return sum(values) / len(values) if values else 0.0
 
@@ -363,15 +338,15 @@ def find_signal(pair: str, base_candles: list[Candle], trigger_candles: list[Can
 def format_alert(signal: Signal) -> str:
     scan_time = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(time.time()))
     return (
-        f"CoinDCX 5m running {signal.side} alert\n"
+        f"CoinDCX 15m {signal.side} alert\n"
         f"Pair: {alert_pair_name(signal.pair)}\n"
         f"Scan time: {scan_time}\n"
         f"Base: 15m sideways ending {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime((signal.setup.base_end_timestamp + BASE_INTERVAL_MS) / 1000))}\n"
         f"Base high: {signal.setup.base_high:g}\n"
         f"Base low: {signal.setup.base_low:g}\n"
         f"Reference volume: {signal.setup.reference_volume:g}\n"
-        f"Running 5m price: {signal.candle.close:g}\n"
-        f"Running 5m volume: {signal.candle.volume:g} ({signal.volume_ratio:.2f}x reference)"
+        f"15m price: {signal.candle.close:g}\n"
+        f"15m volume: {signal.candle.volume:g} ({signal.volume_ratio:.2f}x reference)"
     )
 
 
@@ -436,20 +411,10 @@ def run() -> None:
                 continue
 
             valid_candle_data += 1
-            try:
-                trigger_candles = get_candles(session, pair, TRIGGER_INTERVAL)
-            except requests.RequestException as exc:
-                if is_http_422(exc):
-                    remember_invalid_candle_pair(pair, TRIGGER_INTERVAL)
-                    setups.pop(pair, None)
-                else:
-                    LOGGER.warning("%s 1m candle fetch for running 5m aggregation failed: %s", pair, exc)
-                continue
-            running_5m_candle = build_running_5m_candle(trigger_candles, now_ms)
-            if running_5m_candle is None:
+            if not base_candles:
                 continue
 
-            evaluation = evaluate_trigger(pair, setup, running_5m_candle, now_ms)
+            evaluation = evaluate_trigger(pair, setup, base_candles[-1], now_ms)
             signal = evaluation.signal
             if signal is not None:
                 signals.append(signal)
