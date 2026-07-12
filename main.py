@@ -24,6 +24,7 @@ PAIR_REFRESH_SECONDS = 60 * 60
 CANDLE_LIMIT = 120
 REQUEST_TIMEOUT = 20
 SCAN_SLEEP_SECONDS = float(os.getenv("SCAN_SLEEP_SECONDS", "0.15"))
+FULL_SCAN_DELAY_SECONDS = 3600
 STATE_FILE = Path(os.getenv("STATE_FILE", ".alert_state.json"))
 ALERT_PAIR_NAMES: dict[str, str] = {}
 INVALID_CANDLE_PAIRS: set[str] = set()
@@ -447,7 +448,7 @@ def run() -> None:
 
         if not RUN_FOREVER:
             break
-        time.sleep(max(1.0, SCAN_SLEEP_SECONDS))
+        time.sleep(FULL_SCAN_DELAY_SECONDS)
 
 if __name__ == "__main__":
     run()
