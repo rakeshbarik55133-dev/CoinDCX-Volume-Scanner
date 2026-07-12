@@ -28,6 +28,9 @@ def candle(open_price: float, high: float, low: float, close: float, volume: flo
 
 
 class CoinDCXCandleFetchTests(unittest.TestCase):
+    def test_full_market_refresh_runs_hourly(self) -> None:
+        self.assertEqual(main.PAIR_REFRESH_SECONDS, 60 * 60)
+
     def test_get_usdt_pairs_uses_active_usdt_market_details_pair_for_candle_api(self) -> None:
         class Response:
             def raise_for_status(self) -> None:
@@ -149,9 +152,9 @@ class ImmediateFifteenMinuteTriggerTests(unittest.TestCase):
         self.now_ms = 1_700_020_000_000
 
     def base_candles(self) -> list[Candle]:
-        start = self.now_ms - (12 * 900_000) - 900_000
+        start = self.now_ms - (main.BASE_LOOKBACK * 900_000) - 900_000
         candles: list[Candle] = []
-        for index in range(12):
+        for index in range(main.BASE_LOOKBACK):
             price = 100 + (index % 3) * 0.05
             candles.append(candle(price, 100.45, 99.75, price + 0.02, 50 + (index % 2), start + index * 900_000))
         return candles
@@ -161,6 +164,12 @@ class ImmediateFifteenMinuteTriggerTests(unittest.TestCase):
             setup = find_latest_sideways_base("BLURUSDT", self.base_candles())
         self.assertIsNotNone(setup)
         return setup  # type: ignore[return-value]
+
+    def test_sideways_base_requires_at_least_50_consecutive_15m_candles(self) -> None:
+        self.assertEqual(main.BASE_LOOKBACK, 50)
+        with patch("main.time.time", return_value=self.now_ms / 1000):
+            setup = find_latest_sideways_base("SHORTUSDT", self.base_candles()[:-1])
+        self.assertIsNone(setup)
 
     def test_saves_original_15m_base_levels_and_reference_volume(self) -> None:
         setup = self.latest_base()
@@ -218,7 +227,7 @@ class ImmediateFifteenMinuteTriggerTests(unittest.TestCase):
         later_start = setup.base_end_timestamp + 900_000
         later_base = [
             candle(100 + (index % 2) * 0.03, 100.4, 99.8, 100.01, 80 + (index % 2), later_start + index * 900_000)
-            for index in range(12)
+            for index in range(main.BASE_LOOKBACK)
         ]
         with patch("main.time.time", return_value=(later_base[-1].timestamp + 900_000) / 1000):
             later_setup = find_latest_sideways_base("BLURUSDT", later_base)
