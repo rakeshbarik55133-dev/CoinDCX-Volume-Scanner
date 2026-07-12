@@ -177,6 +177,32 @@ class ImmediateFifteenMinuteTriggerTests(unittest.TestCase):
         self.assertEqual(setup.base_low, 99.75)
         self.assertAlmostEqual(setup.reference_volume, 50.5)
 
+    def test_sideways_base_allows_every_candle_at_or_below_1_6x_average_volume(self) -> None:
+        candles = [
+            candle(item.open, item.high, item.low, item.close, 100, item.timestamp)
+            for item in self.base_candles()
+        ]
+        candles[-1] = candle(candles[-1].open, candles[-1].high, candles[-1].low, candles[-1].close, 160, candles[-1].timestamp)
+
+        with patch("main.time.time", return_value=self.now_ms / 1000):
+            setup = find_latest_sideways_base("FLATUSDT", candles)
+
+        self.assertIsNotNone(setup)
+        self.assertAlmostEqual(setup.reference_volume, 101.2)
+        self.assertLessEqual(max(item.volume for item in candles), setup.reference_volume * main.MAX_BASE_VOLUME_VARIATION_RATIO)
+
+    def test_sideways_base_rejects_any_candle_above_1_6x_average_volume(self) -> None:
+        candles = [
+            candle(item.open, item.high, item.low, item.close, 100, item.timestamp)
+            for item in self.base_candles()
+        ]
+        candles[-1] = candle(candles[-1].open, candles[-1].high, candles[-1].low, candles[-1].close, 170, candles[-1].timestamp)
+
+        with patch("main.time.time", return_value=self.now_ms / 1000):
+            setup = find_latest_sideways_base("SPIKYUSDT", candles)
+
+        self.assertIsNone(setup)
+
     def test_buy_alerts_on_latest_15m_high_break_and_3x_original_volume_without_close_wait(self) -> None:
         setup = self.latest_base()
         latest = candle(100.0, 100.6, 99.9, 100.2, setup.reference_volume * 3, self.now_ms)
