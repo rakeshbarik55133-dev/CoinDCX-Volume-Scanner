@@ -32,7 +32,7 @@ LOGGED_INVALID_CANDLE_PAIRS: set[str] = set()
 # Sideways-base detection. These are intentionally limited to base shape and
 # base volume only; no indicators, ranking, confirmation candles, or late-entry
 # filters are used.
-BASE_LOOKBACK = 12
+BASE_LOOKBACK = 25
 MIN_HISTORY = BASE_LOOKBACK
 MAX_BASE_RANGE_PCT = 0.018
 MAX_BASE_DRIFT_PCT = 0.008
