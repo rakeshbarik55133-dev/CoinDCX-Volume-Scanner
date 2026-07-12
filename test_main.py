@@ -176,6 +176,7 @@ class ImmediateFifteenMinuteTriggerTests(unittest.TestCase):
         self.assertEqual(setup.base_high, 100.45)
         self.assertEqual(setup.base_low, 99.75)
         self.assertAlmostEqual(setup.reference_volume, 50.5)
+        self.assertAlmostEqual(setup.max_base_volume, 51)
 
     def test_sideways_base_allows_every_candle_at_or_below_1_6x_average_volume(self) -> None:
         candles = [
@@ -226,6 +227,33 @@ class ImmediateFifteenMinuteTriggerTests(unittest.TestCase):
         self.assertIsNone(evaluation.signal)
         self.assertEqual(evaluation.rejection_reason, "volume_spike_too_small")
 
+    def test_rejects_break_when_latest_15m_volume_is_less_than_2x_base_max_volume(self) -> None:
+        candles = [
+            candle(item.open, item.high, item.low, item.close, 100, item.timestamp)
+            for item in self.base_candles()
+        ]
+        candles[-1] = candle(candles[-1].open, candles[-1].high, candles[-1].low, candles[-1].close, 160, candles[-1].timestamp)
+        with patch("main.time.time", return_value=self.now_ms / 1000):
+            setup = find_latest_sideways_base("MAXBASEUSDT", candles)
+
+        self.assertIsNotNone(setup)
+        assert setup is not None
+        self.assertAlmostEqual(setup.reference_volume, 101.2)
+        self.assertAlmostEqual(setup.max_base_volume, 160)
+        self.assertGreater(
+            setup.max_base_volume * main.TRIGGER_MAX_BASE_VOLUME_MULTIPLE,
+            setup.reference_volume * main.TRIGGER_VOLUME_MULTIPLE,
+        )
+
+        too_small = candle(100, 100.7, 99.9, 100.2, 319.99, self.now_ms)
+        exact = candle(100, 100.7, 99.9, 100.2, 320, self.now_ms)
+
+        rejected = evaluate_trigger("MAXBASEUSDT", setup, too_small, self.now_ms)
+        accepted = evaluate_trigger("MAXBASEUSDT", setup, exact, self.now_ms)
+
+        self.assertIsNone(rejected.signal)
+        self.assertEqual(rejected.rejection_reason, "volume_spike_too_small")
+        self.assertIsNotNone(accepted.signal)
 
     def test_previous_candle_volume_is_ignored_for_trigger_reference(self) -> None:
         setup = self.latest_base()
@@ -272,7 +300,17 @@ class ImmediateFifteenMinuteTriggerTests(unittest.TestCase):
     def test_alert_requires_trigger_volume_at_least_3x_saved_sideways_average(self) -> None:
         setup = self.latest_base()
         too_small = candle(100, 100.7, 99.9, 100.2, setup.reference_volume * 3 - 0.01, self.now_ms)
-        exact = candle(100, 100.7, 99.9, 100.2, setup.reference_volume * 3, self.now_ms)
+        exact = candle(
+            100,
+            100.7,
+            99.9,
+            100.2,
+            max(
+                setup.reference_volume * main.TRIGGER_VOLUME_MULTIPLE,
+                setup.max_base_volume * main.TRIGGER_MAX_BASE_VOLUME_MULTIPLE,
+            ),
+            self.now_ms,
+        )
 
         rejected = evaluate_trigger("THRESHOLDUSDT", setup, too_small, self.now_ms)
         accepted = evaluate_trigger("THRESHOLDUSDT", setup, exact, self.now_ms)
@@ -280,7 +318,14 @@ class ImmediateFifteenMinuteTriggerTests(unittest.TestCase):
         self.assertIsNone(rejected.signal)
         self.assertEqual(rejected.rejection_reason, "volume_spike_too_small")
         self.assertIsNotNone(accepted.signal)
-        self.assertAlmostEqual(accepted.signal.volume_ratio, 3.0)
+        self.assertAlmostEqual(
+            accepted.signal.volume_ratio,
+            max(
+                setup.reference_volume * main.TRIGGER_VOLUME_MULTIPLE,
+                setup.max_base_volume * main.TRIGGER_MAX_BASE_VOLUME_MULTIPLE,
+            )
+            / setup.reference_volume,
+        )
 
     def test_missed_scan_recovery_alerts_when_next_scan_price_still_beyond_original_high(self) -> None:
         setup = self.latest_base()
