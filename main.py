@@ -20,7 +20,7 @@ TELEGRAM_URL = "https://api.telegram.org/bot{token}/sendMessage"
 BASE_INTERVAL = "15m"
 TRIGGER_INTERVAL = BASE_INTERVAL
 BASE_INTERVAL_MS = 15 * 60 * 1000
-PAIR_REFRESH_SECONDS = 30 * 60
+PAIR_REFRESH_SECONDS = 60 * 60
 CANDLE_LIMIT = 120
 REQUEST_TIMEOUT = 20
 SCAN_SLEEP_SECONDS = float(os.getenv("SCAN_SLEEP_SECONDS", "0.15"))
@@ -32,7 +32,7 @@ LOGGED_INVALID_CANDLE_PAIRS: set[str] = set()
 # Sideways-base detection. These are intentionally limited to base shape and
 # base volume only; no indicators, ranking, confirmation candles, or late-entry
 # filters are used.
-BASE_LOOKBACK = 12
+BASE_LOOKBACK = 50
 MIN_HISTORY = BASE_LOOKBACK
 MAX_BASE_RANGE_PCT = 0.018
 MAX_BASE_DRIFT_PCT = 0.008
