@@ -38,6 +38,7 @@ MAX_BASE_RANGE_PCT = 0.018
 MAX_BASE_DRIFT_PCT = 0.008
 MAX_BASE_VOLUME_VARIATION_RATIO = 1.6
 TRIGGER_VOLUME_MULTIPLE = 3.0
+TRIGGER_MAX_BASE_VOLUME_MULTIPLE = 2.0
 SETUP_EXPIRY_SECONDS = int(os.getenv("SETUP_EXPIRY_SECONDS", str(6 * 60 * 60)))
 RUN_FOREVER = os.getenv("RUN_FOREVER", "0") == "1"
 
@@ -65,11 +66,12 @@ class BaseSetup:
     base_high: float
     base_low: float
     reference_volume: float
+    max_base_volume: float
     expires_at: int
 
     @property
     def setup_key(self) -> str:
-        return f"{self.pair}:{self.base_end_timestamp}:{self.base_high:g}:{self.base_low:g}:{self.reference_volume:g}"
+        return f"{self.pair}:{self.base_end_timestamp}:{self.base_high:g}:{self.base_low:g}:{self.reference_volume:g}:{self.max_base_volume:g}"
 
 
 @dataclass(frozen=True)
@@ -267,9 +269,10 @@ def find_latest_sideways_base(pair: str, candles: list[Candle]) -> BaseSetup | N
     if abs(base[-1].close - base[0].open) / base_mid > MAX_BASE_DRIFT_PCT:
         return None
     reference_volume = _mean([candle.volume for candle in base])
+    max_base_volume = max(candle.volume for candle in base)
     if reference_volume <= 0:
         return None
-    if max(candle.volume for candle in base) > reference_volume * MAX_BASE_VOLUME_VARIATION_RATIO:
+    if max_base_volume > reference_volume * MAX_BASE_VOLUME_VARIATION_RATIO:
         return None
     base_end_timestamp = base[-1].timestamp
     return BaseSetup(
@@ -278,6 +281,7 @@ def find_latest_sideways_base(pair: str, candles: list[Candle]) -> BaseSetup | N
         base_high=base_high,
         base_low=base_low,
         reference_volume=reference_volume,
+        max_base_volume=max_base_volume,
         expires_at=base_end_timestamp + BASE_INTERVAL_MS + (SETUP_EXPIRY_SECONDS * 1000),
     )
 
@@ -290,6 +294,7 @@ def restore_setup(raw: dict[str, Any]) -> BaseSetup | None:
             base_high=float(raw["base_high"]),
             base_low=float(raw["base_low"]),
             reference_volume=float(raw["reference_volume"]),
+            max_base_volume=float(raw.get("max_base_volume", raw["reference_volume"])),
             expires_at=int(raw["expires_at"]),
         )
     except (KeyError, TypeError, ValueError):
@@ -301,6 +306,8 @@ def evaluate_trigger(pair: str, setup: BaseSetup, trigger_candle: Candle, now_ms
     if now > setup.expires_at:
         return SignalEvaluation(None, "setup_expired")
     if trigger_candle.volume < setup.reference_volume * TRIGGER_VOLUME_MULTIPLE:
+        return SignalEvaluation(None, "volume_spike_too_small")
+    if trigger_candle.volume < setup.max_base_volume * TRIGGER_MAX_BASE_VOLUME_MULTIPLE:
         return SignalEvaluation(None, "volume_spike_too_small")
     volume_ratio = trigger_candle.volume / setup.reference_volume
     if trigger_candle.high > setup.base_high or trigger_candle.close > setup.base_high:
