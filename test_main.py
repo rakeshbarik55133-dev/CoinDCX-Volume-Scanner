@@ -149,9 +149,9 @@ class ImmediateFifteenMinuteTriggerTests(unittest.TestCase):
         self.now_ms = 1_700_020_000_000
 
     def base_candles(self) -> list[Candle]:
-        start = self.now_ms - (12 * 900_000) - 900_000
+        start = self.now_ms - (25 * 900_000) - 900_000
         candles: list[Candle] = []
-        for index in range(12):
+        for index in range(25):
             price = 100 + (index % 3) * 0.05
             candles.append(candle(price, 100.45, 99.75, price + 0.02, 50 + (index % 2), start + index * 900_000))
         return candles
@@ -166,7 +166,7 @@ class ImmediateFifteenMinuteTriggerTests(unittest.TestCase):
         setup = self.latest_base()
         self.assertEqual(setup.base_high, 100.45)
         self.assertEqual(setup.base_low, 99.75)
-        self.assertAlmostEqual(setup.reference_volume, 50.5)
+        self.assertAlmostEqual(setup.reference_volume, 50.48)
 
     def test_buy_alerts_on_latest_15m_high_break_and_3x_original_volume_without_close_wait(self) -> None:
         setup = self.latest_base()
@@ -205,12 +205,12 @@ class ImmediateFifteenMinuteTriggerTests(unittest.TestCase):
 
     def test_saved_sideways_base_average_volume_is_used_for_trigger_ratio(self) -> None:
         setup = self.latest_base()
-        trigger = candle(100, 100.7, 99.9, 100.2, 151.5, self.now_ms)
+        trigger = candle(100, 100.7, 99.9, 100.2, 151.44, self.now_ms)
 
         signal = evaluate_trigger("AVERAGEUSDT", setup, trigger, self.now_ms).signal
 
         self.assertIsNotNone(signal)
-        self.assertAlmostEqual(setup.reference_volume, 50.5)
+        self.assertAlmostEqual(setup.reference_volume, 50.48)
         self.assertAlmostEqual(signal.volume_ratio, 3.0)
 
     def test_existing_setup_reference_volume_is_not_replaced_by_later_base_average(self) -> None:
@@ -218,21 +218,21 @@ class ImmediateFifteenMinuteTriggerTests(unittest.TestCase):
         later_start = setup.base_end_timestamp + 900_000
         later_base = [
             candle(100 + (index % 2) * 0.03, 100.4, 99.8, 100.01, 80 + (index % 2), later_start + index * 900_000)
-            for index in range(12)
+            for index in range(25)
         ]
         with patch("main.time.time", return_value=(later_base[-1].timestamp + 900_000) / 1000):
             later_setup = find_latest_sideways_base("BLURUSDT", later_base)
 
         self.assertIsNotNone(later_setup)
-        self.assertAlmostEqual(setup.reference_volume, 50.5)
-        self.assertAlmostEqual(later_setup.reference_volume, 80.5)
+        self.assertAlmostEqual(setup.reference_volume, 50.48)
+        self.assertAlmostEqual(later_setup.reference_volume, 80.48)
 
         setups = {"BLURUSDT": setup}
         if later_setup and "BLURUSDT" not in setups:
             setups["BLURUSDT"] = later_setup
 
         self.assertIs(setups["BLURUSDT"], setup)
-        self.assertAlmostEqual(setups["BLURUSDT"].reference_volume, 50.5)
+        self.assertAlmostEqual(setups["BLURUSDT"].reference_volume, 50.48)
 
     def test_alert_requires_trigger_volume_at_least_3x_saved_sideways_average(self) -> None:
         setup = self.latest_base()
@@ -262,7 +262,7 @@ class ImmediateFifteenMinuteTriggerTests(unittest.TestCase):
         self.assertIsNotNone(signal)
         self.assertEqual(signal.setup.base_high, 100.45)
         self.assertEqual(signal.setup.base_low, 99.75)
-        self.assertAlmostEqual(signal.setup.reference_volume, 50.5)
+        self.assertAlmostEqual(signal.setup.reference_volume, 50.48)
 
     def test_detect_signal_uses_15m_base_and_latest_15m_candle_only(self) -> None:
         trigger = [candle(100, 100.2, 99.9, 100.1, 10, self.now_ms - 300_000), candle(100, 100.7, 99.9, 100.3, 200, self.now_ms)]
