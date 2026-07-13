@@ -257,6 +257,13 @@ class ImmediateFifteenMinuteTriggerTests(unittest.TestCase):
         self.assertEqual(signal.side, "SELL")
         self.assertEqual(signal.break_level, setup.base_low)
 
+    def test_close_without_high_or_low_cross_does_not_trigger(self) -> None:
+        setup = self.latest_base()
+        latest = candle(100.0, setup.base_high, setup.base_low, setup.base_high + 0.1, setup.reference_volume * 3, self.now_ms)
+        evaluation = evaluate_trigger("CLOSEUSDT", setup, latest, self.now_ms)
+        self.assertIsNone(evaluation.signal)
+        self.assertEqual(evaluation.rejection_reason, "no_base_break")
+
     def test_rejects_break_when_latest_15m_volume_is_less_than_3x_reference(self) -> None:
         setup = self.latest_base()
         latest = candle(100.0, 101.0, 99.9, 100.8, setup.reference_volume * 2.99, self.now_ms)
@@ -264,7 +271,7 @@ class ImmediateFifteenMinuteTriggerTests(unittest.TestCase):
         self.assertIsNone(evaluation.signal)
         self.assertEqual(evaluation.rejection_reason, "volume_spike_too_small")
 
-    def test_rejects_break_when_latest_15m_volume_is_less_than_2x_base_max_volume(self) -> None:
+    def test_trigger_volume_does_not_need_2x_base_max_volume(self) -> None:
         candles = [
             candle(item.open, item.high, item.low, item.close, 100, item.timestamp)
             for item in self.base_candles()
@@ -277,20 +284,12 @@ class ImmediateFifteenMinuteTriggerTests(unittest.TestCase):
         assert setup is not None
         self.assertAlmostEqual(setup.reference_volume, 101.2)
         self.assertAlmostEqual(setup.max_base_volume, 160)
-        self.assertGreater(
-            setup.max_base_volume * main.TRIGGER_MAX_BASE_VOLUME_MULTIPLE,
-            setup.reference_volume * main.TRIGGER_VOLUME_MULTIPLE,
-        )
 
-        too_small = candle(100, 100.7, 99.9, 100.2, 319.99, self.now_ms)
-        exact = candle(100, 100.7, 99.9, 100.2, 320, self.now_ms)
+        exact_3x_average = candle(100, 100.7, 99.9, 100.2, setup.reference_volume * 3, self.now_ms)
+        accepted = evaluate_trigger("MAXBASEUSDT", setup, exact_3x_average, self.now_ms)
 
-        rejected = evaluate_trigger("MAXBASEUSDT", setup, too_small, self.now_ms)
-        accepted = evaluate_trigger("MAXBASEUSDT", setup, exact, self.now_ms)
-
-        self.assertIsNone(rejected.signal)
-        self.assertEqual(rejected.rejection_reason, "volume_spike_too_small")
         self.assertIsNotNone(accepted.signal)
+        self.assertAlmostEqual(accepted.signal.volume_ratio, 3.0)
 
     def test_previous_candle_volume_is_ignored_for_trigger_reference(self) -> None:
         setup = self.latest_base()
@@ -342,10 +341,7 @@ class ImmediateFifteenMinuteTriggerTests(unittest.TestCase):
             100.7,
             99.9,
             100.2,
-            max(
-                setup.reference_volume * main.TRIGGER_VOLUME_MULTIPLE,
-                setup.max_base_volume * main.TRIGGER_MAX_BASE_VOLUME_MULTIPLE,
-            ),
+            setup.reference_volume * main.TRIGGER_VOLUME_MULTIPLE,
             self.now_ms,
         )
 
@@ -355,14 +351,7 @@ class ImmediateFifteenMinuteTriggerTests(unittest.TestCase):
         self.assertIsNone(rejected.signal)
         self.assertEqual(rejected.rejection_reason, "volume_spike_too_small")
         self.assertIsNotNone(accepted.signal)
-        self.assertAlmostEqual(
-            accepted.signal.volume_ratio,
-            max(
-                setup.reference_volume * main.TRIGGER_VOLUME_MULTIPLE,
-                setup.max_base_volume * main.TRIGGER_MAX_BASE_VOLUME_MULTIPLE,
-            )
-            / setup.reference_volume,
-        )
+        self.assertAlmostEqual(accepted.signal.volume_ratio, main.TRIGGER_VOLUME_MULTIPLE)
 
     def test_missed_scan_recovery_alerts_when_next_scan_price_still_beyond_original_high(self) -> None:
         setup = self.latest_base()
@@ -406,12 +395,11 @@ class ImmediateFifteenMinuteTriggerTests(unittest.TestCase):
         self.assertEqual(state["sent_alerts"], {"alert-key"})
         self.assertEqual(state["setups"]["BLURUSDT"]["base_high"], setup.base_high)
 
-    def test_setup_expires(self) -> None:
+    def test_setup_remains_active_without_time_expiry(self) -> None:
         setup = self.latest_base()
         latest = candle(100, 101, 99, 100.8, setup.reference_volume * 4, setup.expires_at + 1)
         evaluation = evaluate_trigger("EXPIREUSDT", setup, latest, setup.expires_at + 1)
-        self.assertIsNone(evaluation.signal)
-        self.assertEqual(evaluation.rejection_reason, "setup_expired")
+        self.assertIsNotNone(evaluation.signal)
 
 
 if __name__ == "__main__":

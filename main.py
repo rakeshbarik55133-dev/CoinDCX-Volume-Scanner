@@ -22,7 +22,7 @@ BASE_INTERVAL = "15m"
 TRIGGER_INTERVAL = BASE_INTERVAL
 BASE_INTERVAL_MS = 15 * 60 * 1000
 PAIR_REFRESH_SECONDS = 60 * 60
-CANDLE_LIMIT = 120
+CANDLE_LIMIT = 1000
 REQUEST_TIMEOUT = 20
 SCAN_SLEEP_SECONDS = float(os.getenv("SCAN_SLEEP_SECONDS", "0.15"))
 FULL_SCAN_DELAY_SECONDS = 3600
@@ -40,8 +40,6 @@ MAX_BASE_RANGE_PCT = 0.018
 MAX_BASE_DRIFT_PCT = 0.008
 MAX_BASE_VOLUME_VARIATION_RATIO = 1.6
 TRIGGER_VOLUME_MULTIPLE = 3.0
-TRIGGER_MAX_BASE_VOLUME_MULTIPLE = 2.0
-SETUP_EXPIRY_SECONDS = int(os.getenv("SETUP_EXPIRY_SECONDS", str(6 * 60 * 60)))
 RUN_FOREVER = os.getenv("RUN_FOREVER", "0") == "1"
 
 logging.basicConfig(
@@ -300,7 +298,7 @@ def find_latest_sideways_base(pair: str, candles: list[Candle]) -> BaseSetup | N
         base_low=base_low,
         reference_volume=reference_volume,
         max_base_volume=max_base_volume,
-        expires_at=base_end_timestamp + BASE_INTERVAL_MS + (SETUP_EXPIRY_SECONDS * 1000),
+        expires_at=base_end_timestamp + BASE_INTERVAL_MS,
     )
 
 
@@ -321,16 +319,12 @@ def restore_setup(raw: dict[str, Any]) -> BaseSetup | None:
 
 def evaluate_trigger(pair: str, setup: BaseSetup, trigger_candle: Candle, now_ms: int | None = None) -> SignalEvaluation:
     now = int(time.time() * 1000) if now_ms is None else now_ms
-    if now > setup.expires_at:
-        return SignalEvaluation(None, "setup_expired")
     if trigger_candle.volume < setup.reference_volume * TRIGGER_VOLUME_MULTIPLE:
         return SignalEvaluation(None, "volume_spike_too_small")
-    if trigger_candle.volume < setup.max_base_volume * TRIGGER_MAX_BASE_VOLUME_MULTIPLE:
-        return SignalEvaluation(None, "volume_spike_too_small")
     volume_ratio = trigger_candle.volume / setup.reference_volume
-    if trigger_candle.high > setup.base_high or trigger_candle.close > setup.base_high:
+    if trigger_candle.high > setup.base_high:
         return SignalEvaluation(Signal(pair, "BUY", trigger_candle, setup, volume_ratio))
-    if trigger_candle.low < setup.base_low or trigger_candle.close < setup.base_low:
+    if trigger_candle.low < setup.base_low:
         return SignalEvaluation(Signal(pair, "SELL", trigger_candle, setup, volume_ratio))
     return SignalEvaluation(None, "no_base_break")
 
@@ -431,10 +425,6 @@ def run() -> None:
             if setup is None:
                 too_few_candles += 1
                 continue
-            if now_ms > setup.expires_at:
-                setups.pop(pair, None)
-                continue
-
             valid_candle_data += 1
             if not base_candles:
                 continue
