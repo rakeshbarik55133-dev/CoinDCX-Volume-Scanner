@@ -15,11 +15,13 @@ from main import (
     evaluate_signal,
     evaluate_trigger,
     find_latest_sideways_base,
+    format_utc_timestamp,
     get_candles,
     get_usdt_pairs,
     remember_invalid_candle_pair,
     load_state,
     save_state,
+    wait_for_next_scan,
 )
 
 
@@ -145,6 +147,41 @@ class CoinDCXCandleFetchTests(unittest.TestCase):
         self.assertIn("15m candle response", logs.output[0])
         self.assertIn("status=200", logs.output[0])
 
+
+
+class ForeverLoopSchedulingTests(unittest.TestCase):
+    def test_next_scan_is_scheduled_one_hour_after_completed_scan(self) -> None:
+        completed_at = 1_700_000_000.0
+        self.assertEqual(format_utc_timestamp(completed_at + main.FULL_SCAN_DELAY_SECONDS), "2023-11-14 23:13:20 UTC")
+
+        sleeps: list[float] = []
+        current_time = completed_at
+
+        def fake_time() -> float:
+            return current_time
+
+        def fake_sleep(seconds: float) -> None:
+            nonlocal current_time
+            sleeps.append(seconds)
+            current_time += main.FULL_SCAN_DELAY_SECONDS
+
+        with patch("main.time.time", side_effect=fake_time), patch("main.time.sleep", side_effect=fake_sleep):
+            with self.assertLogs("main", level="INFO") as logs:
+                wait_for_next_scan(completed_at)
+
+        self.assertEqual(sleeps, [60.0])
+        self.assertIn("next scan scheduled at 2023-11-14 23:13:20 UTC", logs.output[0])
+
+    def test_late_wake_starts_next_scan_without_extra_hour(self) -> None:
+        completed_at = 1_700_000_000.0
+        late_wake_time = completed_at + main.FULL_SCAN_DELAY_SECONDS + 5
+
+        with patch("main.time.time", return_value=late_wake_time), patch("main.time.sleep") as sleep_mock:
+            with self.assertLogs("main", level="WARNING") as logs:
+                wait_for_next_scan(completed_at)
+
+        sleep_mock.assert_not_called()
+        self.assertIn("next scan is starting 5.0 seconds late", logs.output[0])
 
 
 class ImmediateFifteenMinuteTriggerTests(unittest.TestCase):

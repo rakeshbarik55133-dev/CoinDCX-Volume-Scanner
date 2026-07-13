@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import time
+from datetime import datetime, timezone
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,22 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 LOGGER = logging.getLogger(__name__)
+
+
+def format_utc_timestamp(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def wait_for_next_scan(completed_at: float) -> None:
+    next_scan_at = completed_at + FULL_SCAN_DELAY_SECONDS
+    LOGGER.info("next scan scheduled at %s", format_utc_timestamp(next_scan_at))
+    while True:
+        remaining_seconds = next_scan_at - time.time()
+        if remaining_seconds <= 0:
+            if remaining_seconds < -1:
+                LOGGER.warning("next scan is starting %.1f seconds late", abs(remaining_seconds))
+            return
+        time.sleep(min(remaining_seconds, 60.0))
 
 
 @dataclass(frozen=True)
@@ -446,9 +463,10 @@ def run() -> None:
         LOGGER.info("valid BUY/SELL signals found: BUY=%s SELL=%s TOTAL=%s", buy_count, sell_count, len(signals))
         LOGGER.info("Telegram alerts sent: %s", alerts_sent)
 
+        completed_at = time.time()
         if not RUN_FOREVER:
             break
-        time.sleep(FULL_SCAN_DELAY_SECONDS)
+        wait_for_next_scan(completed_at)
 
 if __name__ == "__main__":
     run()
