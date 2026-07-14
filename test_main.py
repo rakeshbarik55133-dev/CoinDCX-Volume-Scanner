@@ -17,6 +17,7 @@ from main import (
     find_latest_sideways_base,
     format_utc_timestamp,
     get_candles,
+    get_latest_trigger_candle,
     get_usdt_pairs,
     remember_invalid_candle_pair,
     load_state,
@@ -376,6 +377,26 @@ class ImmediateFifteenMinuteTriggerTests(unittest.TestCase):
             signal = detect_signal("FASTUSDT", self.base_candles(), trigger)
         self.assertIsNotNone(signal)
         self.assertEqual(signal.candle.timestamp, self.now_ms)
+
+    def test_live_trigger_candle_is_after_fully_closed_base(self) -> None:
+        setup = self.latest_base()
+        closed_base_candles = self.base_candles()
+        forming_trigger = candle(100, 100.7, 99.9, 100.3, setup.reference_volume * 3, self.now_ms)
+
+        trigger = get_latest_trigger_candle(closed_base_candles + [forming_trigger], setup)
+        signal = evaluate_trigger("LIVEUSDT", setup, trigger, self.now_ms).signal if trigger else None
+
+        self.assertIsNotNone(trigger)
+        self.assertEqual(trigger.timestamp, self.now_ms)
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.side, "BUY")
+
+    def test_last_base_candle_is_not_reused_as_trigger_when_no_live_candle_exists(self) -> None:
+        setup = self.latest_base()
+
+        trigger = get_latest_trigger_candle(self.base_candles(), setup)
+
+        self.assertIsNone(trigger)
 
     def test_evaluate_signal_reports_no_sideways_base_without_adding_other_filters(self) -> None:
         candles = self.base_candles()
