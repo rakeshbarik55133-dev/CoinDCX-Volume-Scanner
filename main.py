@@ -268,6 +268,11 @@ def get_closed_candles(candles: list[Candle], interval_ms: int = BASE_INTERVAL_M
     return [candle for candle in candles if candle.timestamp + interval_ms <= now_ms]
 
 
+def get_latest_trigger_candle(candles: list[Candle], setup: BaseSetup) -> Candle | None:
+    trigger_candles = [candle for candle in candles if candle.timestamp > setup.base_end_timestamp]
+    return trigger_candles[-1] if trigger_candles else None
+
+
 def _mean(values: list[float]) -> float:
     return sum(values) / len(values) if values else 0.0
 
@@ -426,10 +431,11 @@ def run() -> None:
                 too_few_candles += 1
                 continue
             valid_candle_data += 1
-            if not base_candles:
+            trigger_candle = get_latest_trigger_candle(base_candles, setup)
+            if trigger_candle is None:
                 continue
 
-            evaluation = evaluate_trigger(pair, setup, base_candles[-1], now_ms)
+            evaluation = evaluate_trigger(pair, setup, trigger_candle, now_ms)
             signal = evaluation.signal
             if signal is not None:
                 signals.append(signal)
