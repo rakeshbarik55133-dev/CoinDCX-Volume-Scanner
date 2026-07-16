@@ -194,17 +194,26 @@ def get_usdt_pairs(session: requests.Session) -> list[str]:
     response = session.get(COINDCX_MARKETS_URL, timeout=REQUEST_TIMEOUT)
     response.raise_for_status()
     pairs: set[str] = set()
+
     for market in response.json():
         pair = market.get("pair")
         if not pair or not is_usdt_market(market):
             continue
+
+        if str(market.get("ecode", "")).upper() != "B":
+            continue
+
+        status = str(market.get("status", "active")).lower()
+        if status not in {"active", "online"}:
+            continue
+
         pair_text = coindcx_candle_pair_name(market)
         if pair_text is None or pair_text in INVALID_CANDLE_PAIRS:
             continue
+
         pairs.add(pair_text)
         ALERT_PAIR_NAMES[pair_text] = coindcx_alert_pair_name(market, str(pair))
     return sorted(pairs)
-
 
 def normalize_candle(raw: dict[str, Any] | list[Any]) -> Candle | None:
     if isinstance(raw, list):
