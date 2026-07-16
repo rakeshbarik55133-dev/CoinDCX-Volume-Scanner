@@ -41,9 +41,13 @@ class CoinDCXCandleFetchTests(unittest.TestCase):
 
             def json(self) -> list[dict[str, str]]:
                 return [
-                    {"coindcx_name": "BTCUSDT", "target_currency_short_name": "USDT", "pair": "B-BTC_USDT", "status": "active"},
-                    {"coindcx_name": "ETHUSDT", "target_currency_short_name": "USDT", "pair": "B-ETH_USDT", "status": "inactive"},
-                    {"coindcx_name": "ETHBTC", "target_currency_short_name": "BTC", "pair": "B-ETH_BTC", "status": "active"},
+                    {"coindcx_name": "BTCUSDT", "target_currency_short_name": "USDT", "pair": "B-BTC_USDT", "status": "active", "ecode": "B"},
+                    {"coindcx_name": "ETHUSDT", "target_currency_short_name": "USDT", "pair": "B-ETH_USDT", "status": "inactive", "ecode": "B"},
+                    {"coindcx_name": "ETHBTC", "target_currency_short_name": "BTC", "pair": "B-ETH_BTC", "status": "active", "ecode": "B"},
+                    {"coindcx_name": "SOLUSDT", "target_currency_short_name": "USDT", "pair": "I-SOL_USDT", "status": "active", "ecode": "I"},
+                    {"coindcx_name": "XRPUSDT", "quote_currency_short_name": "USDT", "pair": "B-XRP_USDT", "status": "active", "ecode": "B"},
+                    {"coindcx_name": "ADAUSDT", "target_currency_short_name": "BTC", "pair": "B-ADA_USDT", "status": "active", "ecode": "B"},
+                    {"coindcx_name": "DOGEUSDT", "target_currency_short_name": "USDT", "pair": "B-DOGE_USDT", "status": "online", "ecode": "B"},
                 ]
 
         class Session:
@@ -60,8 +64,8 @@ class CoinDCXCandleFetchTests(unittest.TestCase):
 
             def json(self) -> list[dict[str, str]]:
                 return [
-                    {"coindcx_name": "1000CHEEMSUSDT", "target_currency_short_name": "USDT", "pair": "B-1000CHEEMS_USDT", "status": "active"},
-                    {"coindcx_name": "BTCUSDT", "target_currency_short_name": "USDT", "pair": "B-BTC_USDT", "status": "active"},
+                    {"coindcx_name": "1000CHEEMSUSDT", "target_currency_short_name": "USDT", "pair": "B-1000CHEEMS_USDT", "status": "active", "ecode": "B"},
+                    {"coindcx_name": "BTCUSDT", "target_currency_short_name": "USDT", "pair": "B-BTC_USDT", "status": "active", "ecode": "B"},
                 ]
 
         class Session:
