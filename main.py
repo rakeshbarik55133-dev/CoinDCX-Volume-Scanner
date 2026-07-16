@@ -160,15 +160,11 @@ def save_state(sent_alerts: set[str], setups: dict[str, BaseSetup]) -> None:
 
 
 def is_usdt_market(market: dict[str, Any]) -> bool:
-    quote_values = [
-        market.get("target_currency_short_name"),
-        market.get("quote_currency_short_name"),
-        market.get("quote_currency"),
-    ]
-    if any(str(value).upper() == "USDT" for value in quote_values if value):
-        return True
-    pair_name = str(market.get("coindcx_name") or market.get("symbol") or market.get("pair") or "").upper()
-    return pair_name.endswith("USDT") or pair_name.endswith("_USDT")
+    return (
+        str(market.get("ecode", "")).upper() == "B"
+        and str(market.get("status", "")).lower() == "active"
+        and str(market.get("target_currency_short_name", "")).upper() == "USDT"
+    )
 
 
 def coindcx_alert_pair_name(market: dict[str, Any], pair: str) -> str:
@@ -202,13 +198,11 @@ def get_usdt_pairs(session: requests.Session) -> list[str]:
         pair = market.get("pair")
         if not pair or not is_usdt_market(market):
             continue
-        status = str(market.get("status", "active")).lower()
-        if status in {"active", "online"}:
-            pair_text = coindcx_candle_pair_name(market)
-            if pair_text is None or pair_text in INVALID_CANDLE_PAIRS:
-                continue
-            pairs.add(pair_text)
-            ALERT_PAIR_NAMES[pair_text] = coindcx_alert_pair_name(market, str(pair))
+        pair_text = coindcx_candle_pair_name(market)
+        if pair_text is None or pair_text in INVALID_CANDLE_PAIRS:
+            continue
+        pairs.add(pair_text)
+        ALERT_PAIR_NAMES[pair_text] = coindcx_alert_pair_name(market, str(pair))
     return sorted(pairs)
 
 
