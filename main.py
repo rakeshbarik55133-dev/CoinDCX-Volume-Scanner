@@ -22,6 +22,7 @@ BASE_INTERVAL = "15m"
 TRIGGER_INTERVAL = BASE_INTERVAL
 BASE_INTERVAL_MS = 15 * 60 * 1000
 PAIR_REFRESH_SECONDS = 60 * 60
+NETWORK_RETRY_SECONDS = 60
 CANDLE_LIMIT = 1000
 REQUEST_TIMEOUT = 20
 SCAN_SLEEP_SECONDS = float(os.getenv("SCAN_SLEEP_SECONDS", "0.15"))
@@ -380,13 +381,36 @@ def send_telegram(session: requests.Session, message: str) -> bool:
     if not token or not chat_id:
         LOGGER.info("BOT_TOKEN or CHAT_ID missing; dry scan only, alert not sent")
         return False
-    response = session.post(
-        TELEGRAM_URL.format(token=token),
-        json={"chat_id": chat_id, "text": message, "disable_web_page_preview": True},
-        timeout=REQUEST_TIMEOUT,
-    )
-    response.raise_for_status()
+    try:
+        response = session.post(
+            TELEGRAM_URL.format(token=token),
+            json={"chat_id": chat_id, "text": message, "disable_web_page_preview": True},
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        LOGGER.warning("Telegram alert send failed: %s", exc)
+        return False
     return True
+
+
+def refresh_usdt_pairs(session: requests.Session, cached_pairs: list[str]) -> tuple[list[str], bool]:
+    while True:
+        try:
+            pairs = get_usdt_pairs(session)
+        except requests.RequestException as exc:
+            LOGGER.warning(
+                "CoinDCX market list refresh failed: %s; retrying in %s seconds",
+                exc,
+                NETWORK_RETRY_SECONDS,
+            )
+            time.sleep(NETWORK_RETRY_SECONDS)
+            if cached_pairs:
+                LOGGER.info("continuing with cached CoinDCX USDT pair universe: %s", len(cached_pairs))
+                return cached_pairs, False
+            continue
+        LOGGER.info("refreshed active CoinDCX USDT pair universe: %s", len(pairs))
+        return pairs, True
 
 
 def run() -> None:
@@ -399,67 +423,78 @@ def run() -> None:
     last_pair_refresh = 0.0
 
     while True:
-        if not pairs or time.time() - last_pair_refresh >= PAIR_REFRESH_SECONDS:
-            pairs = get_usdt_pairs(session)
-            last_pair_refresh = time.time()
-            LOGGER.info("refreshed active CoinDCX USDT pair universe: %s", len(pairs))
+        try:
+            if not pairs or time.time() - last_pair_refresh >= PAIR_REFRESH_SECONDS:
+                pairs, refreshed = refresh_usdt_pairs(session, pairs)
+                if refreshed:
+                    last_pair_refresh = time.time()
 
-        valid_candle_data = 0
-        too_few_candles = 0
-        signals: list[Signal] = []
-        alerts_sent = 0
-        now_ms = int(time.time() * 1000)
+            valid_candle_data = 0
+            too_few_candles = 0
+            signals: list[Signal] = []
+            alerts_sent = 0
+            now_ms = int(time.time() * 1000)
 
-        for pair in pairs:
-            if pair in INVALID_CANDLE_PAIRS:
-                continue
-            try:
-                base_candles = get_candles(session, pair, BASE_INTERVAL)
-            except requests.RequestException as exc:
-                if is_http_422(exc):
-                    remember_invalid_candle_pair(pair, BASE_INTERVAL)
-                else:
-                    LOGGER.warning("%s 15m candle fetch failed: %s", pair, exc)
-                continue
+            for pair in pairs:
+                if pair in INVALID_CANDLE_PAIRS:
+                    continue
+                try:
+                    base_candles = get_candles(session, pair, BASE_INTERVAL)
+                except requests.RequestException as exc:
+                    if is_http_422(exc):
+                        remember_invalid_candle_pair(pair, BASE_INTERVAL)
+                    else:
+                        LOGGER.warning("%s 15m candle fetch failed: %s", pair, exc)
+                    continue
 
-            latest_base = find_latest_sideways_base(pair, base_candles)
-            if latest_base and pair not in setups:
-                setups[pair] = latest_base
+                latest_base = find_latest_sideways_base(pair, base_candles)
+                if latest_base and pair not in setups:
+                    setups[pair] = latest_base
 
-            setup = setups.get(pair)
-            if setup is None:
-                too_few_candles += 1
-                continue
-            valid_candle_data += 1
-            trigger_candle = get_latest_trigger_candle(base_candles, setup)
-            if trigger_candle is None:
-                continue
+                setup = setups.get(pair)
+                if setup is None:
+                    too_few_candles += 1
+                    continue
+                valid_candle_data += 1
+                trigger_candle = get_latest_trigger_candle(base_candles, setup)
+                if trigger_candle is None:
+                    continue
 
-            evaluation = evaluate_trigger(pair, setup, trigger_candle, now_ms)
-            signal = evaluation.signal
-            if signal is not None:
-                signals.append(signal)
-                if signal.alert_key in sent_alerts:
-                    LOGGER.info("duplicate alert skipped: %s", signal.alert_key)
-                    setups.pop(pair, None)
-                elif send_telegram(session, format_alert(signal)):
-                    alerts_sent += 1
-                    sent_alerts.add(signal.alert_key)
-                    setups.pop(pair, None)
-                    save_state(sent_alerts, setups)
+                evaluation = evaluate_trigger(pair, setup, trigger_candle, now_ms)
+                signal = evaluation.signal
+                if signal is not None:
+                    signals.append(signal)
+                    if signal.alert_key in sent_alerts:
+                        LOGGER.info("duplicate alert skipped: %s", signal.alert_key)
+                        setups.pop(pair, None)
+                    elif send_telegram(session, format_alert(signal)):
+                        alerts_sent += 1
+                        sent_alerts.add(signal.alert_key)
+                        setups.pop(pair, None)
+                        save_state(sent_alerts, setups)
 
-            if SCAN_SLEEP_SECONDS > 0:
-                time.sleep(SCAN_SLEEP_SECONDS)
+                if SCAN_SLEEP_SECONDS > 0:
+                    time.sleep(SCAN_SLEEP_SECONDS)
 
-        save_state(sent_alerts, setups)
-        buy_count = sum(1 for signal in signals if signal.side == "BUY")
-        sell_count = sum(1 for signal in signals if signal.side == "SELL")
-        LOGGER.info("pairs with valid candidate setups: %s", valid_candle_data)
-        LOGGER.info("pairs without candidate setups: %s", too_few_candles)
-        LOGGER.info("valid BUY/SELL signals found: BUY=%s SELL=%s TOTAL=%s", buy_count, sell_count, len(signals))
-        LOGGER.info("Telegram alerts sent: %s", alerts_sent)
+            save_state(sent_alerts, setups)
+            buy_count = sum(1 for signal in signals if signal.side == "BUY")
+            sell_count = sum(1 for signal in signals if signal.side == "SELL")
+            LOGGER.info("pairs with valid candidate setups: %s", valid_candle_data)
+            LOGGER.info("pairs without candidate setups: %s", too_few_candles)
+            LOGGER.info("valid BUY/SELL signals found: BUY=%s SELL=%s TOTAL=%s", buy_count, sell_count, len(signals))
+            LOGGER.info("Telegram alerts sent: %s", alerts_sent)
 
-        completed_at = time.time()
+            completed_at = time.time()
+        except requests.RequestException as exc:
+            if not RUN_FOREVER:
+                raise
+            LOGGER.warning(
+                "temporary network error in scan loop: %s; retrying in %s seconds",
+                exc,
+                NETWORK_RETRY_SECONDS,
+            )
+            time.sleep(NETWORK_RETRY_SECONDS)
+            continue
         if not RUN_FOREVER:
             break
         wait_for_next_scan(completed_at)
