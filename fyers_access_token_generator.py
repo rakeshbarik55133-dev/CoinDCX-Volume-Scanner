@@ -81,9 +81,9 @@ def extract_auth_code(redirected_url: str) -> str:
 
 
 def app_id_hash(credentials: FyersCredentials) -> str:
-    """Return FYERS v3 SHA-256 appIdHash for app_id + secret_key."""
+    """Return FYERS v3 SHA-256 appIdHash for client_id:secret_key."""
     return hashlib.sha256(
-        f"{credentials.app_id}{credentials.secret_key}".encode("utf-8")
+        f"{credentials.app_id}:{credentials.secret_key}".encode("utf-8")
     ).hexdigest()
 
 
