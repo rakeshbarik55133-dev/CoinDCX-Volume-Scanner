@@ -18,8 +18,10 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+from datetime import datetime, time as datetime_time, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -30,8 +32,12 @@ INTERVAL = os.getenv("STOCK_INTERVAL", "15m")
 RANGE = os.getenv("STOCK_RANGE", "5d")
 REQUEST_TIMEOUT = 20
 SCAN_SLEEP_SECONDS = float(os.getenv("STOCK_SCAN_SLEEP_SECONDS", "0.15"))
+FULL_SCAN_DELAY_SECONDS = 5 * 60
 STATE_FILE = Path(os.getenv("STOCK_STATE_FILE", ".stock_alert_state.json"))
 DEFAULT_SYMBOLS = "SPY,QQQ,AAPL,MSFT,NVDA,TSLA"
+IST = ZoneInfo("Asia/Kolkata")
+MARKET_OPEN_TIME = datetime_time(9, 0)
+MARKET_CLOSE_TIME = datetime_time(15, 30)
 
 # Separate stock strategy: quiet consolidation followed by a closing break on
 # above-average volume. These constants intentionally do not import or share any
@@ -225,15 +231,52 @@ def send_stock_telegram(session: requests.Session, message: str) -> bool:
     return True
 
 
-def run() -> None:
-    session = requests.Session()
-    sent_alerts = load_state()
-    symbols = configured_symbols()
-    LOGGER.info("total stock symbols configured: %s", len(symbols))
+def now_ist() -> datetime:
+    return datetime.now(IST)
+
+
+def is_market_open(moment: datetime | None = None) -> bool:
+    current = moment or now_ist()
+    current_time = current.timetz().replace(tzinfo=None)
+    return MARKET_OPEN_TIME <= current_time < MARKET_CLOSE_TIME
+
+
+def next_market_open(moment: datetime | None = None) -> datetime:
+    current = moment or now_ist()
+    next_open = current.replace(
+        hour=MARKET_OPEN_TIME.hour,
+        minute=MARKET_OPEN_TIME.minute,
+        second=0,
+        microsecond=0,
+    )
+    if current >= next_open:
+        next_open += timedelta(days=1)
+    return next_open
+
+
+def sleep_until_market_open() -> None:
+    next_open = next_market_open()
+    sleep_seconds = max(0.0, (next_open - now_ist()).total_seconds())
+    LOGGER.info(
+        "outside Indian market hours; waiting until %s IST",
+        next_open.strftime("%Y-%m-%d %H:%M:%S"),
+    )
+    if sleep_seconds > 0:
+        time.sleep(sleep_seconds)
+
+
+def run_scan(session: requests.Session, sent_alerts: set[str], symbols: list[str]) -> None:
+    if not is_market_open():
+        LOGGER.info("market closed before stock scan started; skipping fetches")
+        return
 
     signals: list[StockSignal] = []
     alerts_sent = 0
     for symbol in symbols:
+        if not is_market_open():
+            LOGGER.info("market closed during stock scan; stopping before fetching %s", symbol)
+            break
+
         try:
             candles = get_stock_candles(session, symbol)
         except requests.RequestException as exc:
@@ -257,6 +300,27 @@ def run() -> None:
     sell_count = sum(1 for signal in signals if signal.side == "SELL")
     LOGGER.info("stock BUY/SELL signals found: BUY=%s SELL=%s TOTAL=%s", buy_count, sell_count, len(signals))
     LOGGER.info("stock Telegram alerts sent: %s", alerts_sent)
+
+
+def run() -> None:
+    session = requests.Session()
+    sent_alerts = load_state()
+    symbols = configured_symbols()
+    LOGGER.info("total stock symbols configured: %s", len(symbols))
+
+    while True:
+        if not is_market_open():
+            sleep_until_market_open()
+            continue
+
+        run_scan(session, sent_alerts, symbols)
+
+        next_scan_at = now_ist() + timedelta(seconds=FULL_SCAN_DELAY_SECONDS)
+        if not is_market_open(next_scan_at):
+            sleep_until_market_open()
+        else:
+            LOGGER.info("next stock scan starts at %s IST", next_scan_at.strftime("%Y-%m-%d %H:%M:%S"))
+            time.sleep(FULL_SCAN_DELAY_SECONDS)
 
 
 if __name__ == "__main__":
