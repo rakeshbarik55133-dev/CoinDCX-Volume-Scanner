@@ -19,6 +19,8 @@ import requests
 
 FYERS_AUTH_URL = "https://api-t1.fyers.in/api/v3/generate-authcode"
 FYERS_TOKEN_URL = "https://api-t1.fyers.in/api/v3/validate-authcode"
+FYERS_REDIRECT_URI = "https://127.0.0.1"
+TOKEN_OUTPUT_FILE = "new_token.txt"
 REQUEST_TIMEOUT = 30
 RESPONSE_TYPE = "code"
 GRANT_TYPE = "authorization_code"
@@ -29,21 +31,18 @@ STATE = "fyers-token-generator"
 class FyersCredentials:
     app_id: str
     secret_key: str
-    redirect_uri: str
 
 
 def read_credentials() -> FyersCredentials:
     """Read required FYERS credentials from environment variables."""
     app_id = os.getenv("FYERS_APP_ID", "").strip()
     secret_key = os.getenv("FYERS_SECRET_KEY", "").strip()
-    redirect_uri = os.getenv("FYERS_REDIRECT_URI", "").strip()
 
     missing = [
         name
         for name, value in (
             ("FYERS_APP_ID", app_id),
             ("FYERS_SECRET_KEY", secret_key),
-            ("FYERS_REDIRECT_URI", redirect_uri),
         )
         if not value
     ]
@@ -52,7 +51,7 @@ def read_credentials() -> FyersCredentials:
             "Missing required environment variable(s): " + ", ".join(missing)
         )
 
-    return FyersCredentials(app_id=app_id, secret_key=secret_key, redirect_uri=redirect_uri)
+    return FyersCredentials(app_id=app_id, secret_key=secret_key)
 
 
 def build_login_url(credentials: FyersCredentials) -> str:
@@ -60,7 +59,7 @@ def build_login_url(credentials: FyersCredentials) -> str:
     query = urlencode(
         {
             "client_id": credentials.app_id,
-            "redirect_uri": credentials.redirect_uri,
+            "redirect_uri": FYERS_REDIRECT_URI,
             "response_type": RESPONSE_TYPE,
             "state": STATE,
         }
@@ -82,9 +81,9 @@ def extract_auth_code(redirected_url: str) -> str:
 
 
 def app_id_hash(credentials: FyersCredentials) -> str:
-    """Return FYERS v3 SHA-256 appIdHash for app_id:secret_key."""
+    """Return FYERS v3 SHA-256 appIdHash for app_id + secret_key."""
     return hashlib.sha256(
-        f"{credentials.app_id}:{credentials.secret_key}".encode("utf-8")
+        f"{credentials.app_id}{credentials.secret_key}".encode("utf-8")
     ).hexdigest()
 
 
@@ -96,7 +95,12 @@ def exchange_auth_code(credentials: FyersCredentials, auth_code: str) -> str:
         "code": auth_code,
     }
     response = requests.post(FYERS_TOKEN_URL, json=payload, timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
+    if not response.ok:
+        raise RuntimeError(
+            f"FYERS validate-authcode failed with HTTP {response.status_code}. "
+            f"Response body: {response.text}"
+        )
+
     data: dict[str, Any] = response.json()
 
     access_token = str(data.get("access_token") or "").strip()
@@ -121,7 +125,9 @@ def main() -> int:
 
         auth_code = extract_auth_code(redirected_url)
         access_token = exchange_auth_code(credentials, auth_code)
-        print(access_token)
+        with open(TOKEN_OUTPUT_FILE, "w", encoding="utf-8") as token_file:
+            token_file.write(access_token)
+        print(f"Access token saved to {TOKEN_OUTPUT_FILE}")
         return 0
     except (RuntimeError, ValueError, requests.RequestException) as error:
         print(f"ERROR: {error}", file=sys.stderr)
