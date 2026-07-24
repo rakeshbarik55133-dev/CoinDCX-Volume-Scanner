@@ -257,17 +257,14 @@ def next_market_open(moment: datetime | None = None) -> datetime:
 def sleep_until_market_open() -> None:
     next_open = next_market_open()
     sleep_seconds = max(0.0, (next_open - now_ist()).total_seconds())
-    LOGGER.info(
-        "outside Indian market hours; waiting until %s IST",
-        next_open.strftime("%Y-%m-%d %H:%M:%S"),
-    )
+    LOGGER.info("Outside market hours. Next scan at %s IST.", next_open.strftime("%H:%M"))
     if sleep_seconds > 0:
         time.sleep(sleep_seconds)
 
 
 def run_scan(session: requests.Session, sent_alerts: set[str], symbols: list[str]) -> None:
     if not is_market_open():
-        LOGGER.info("market closed before stock scan started; skipping fetches")
+        sleep_until_market_open()
         return
 
     signals: list[StockSignal] = []
@@ -305,14 +302,14 @@ def run_scan(session: requests.Session, sent_alerts: set[str], symbols: list[str
 def run() -> None:
     session = requests.Session()
     sent_alerts = load_state()
-    symbols = configured_symbols()
-    LOGGER.info("total stock symbols configured: %s", len(symbols))
 
     while True:
         if not is_market_open():
             sleep_until_market_open()
             continue
 
+        symbols = configured_symbols()
+        LOGGER.info("total stock symbols configured: %s", len(symbols))
         run_scan(session, sent_alerts, symbols)
 
         next_scan_at = now_ist() + timedelta(seconds=FULL_SCAN_DELAY_SECONDS)
