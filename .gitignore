@@ -1,0 +1,4 @@
+__pycache__/
+*.py[cod]
+new_token.txt
+test_new_token.txt

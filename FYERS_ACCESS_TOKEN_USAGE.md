@@ -40,15 +40,19 @@ Set these variables locally before running the helper:
 
 6. After FYERS redirects you to your redirect URI, copy the full redirected URL from the browser address bar.
 
-7. Paste that full redirected URL back into the terminal prompt.
+7. Re-run the helper with `FYERS_REDIRECTED_URL` set to that full redirected URL:
 
-8. The helper extracts the `auth_code` locally, exchanges it with FYERS using the official API v3 authorization-code flow, and prints the final access token exactly once.
+   ```bash
+   FYERS_REDIRECTED_URL="https://your-redirect-uri?auth_code=..." python fyers_access_token_generator.py
+   ```
 
-9. Copy the printed access token immediately and save it as the GitHub Secret named `FYERS_ACCESS_TOKEN`.
+8. The helper extracts the `auth_code` locally, exchanges it with FYERS through the official `fyers-apiv3` SDK flow, and writes the final access token to `new_token.txt`.
+
+9. Copy the access token from `new_token.txt` immediately and save it as the GitHub Secret named `FYERS_ACCESS_TOKEN`.
 
 ## Security notes
 
 - The helper never prints or logs `FYERS_SECRET_KEY`.
 - The helper never prints or logs the extracted `auth_code`.
-- The final FYERS access token is printed only once so you can copy it directly into GitHub Secrets.
+- The final FYERS access token is written to `new_token.txt`; delete this file after saving the token in GitHub Secrets.
 - Run this only on a trusted local machine and avoid saving terminal logs that contain the final access token.
