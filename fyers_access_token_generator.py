@@ -1,4 +1,4 @@
-"""One-time FYERS API v3 access-token generator.
+"""One-time FYERS API v3 access-token generator using the official SDK flow.
 
 This helper is intentionally separate from the CoinDCX scanner and does not
 place orders or automate trading. It only performs the FYERS API v3 user-app
@@ -8,20 +8,13 @@ as the FYERS_ACCESS_TOKEN GitHub Secret.
 
 from __future__ import annotations
 
-import hashlib
 import os
 import sys
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, urlparse
 
-import requests
-
-FYERS_AUTH_URL = "https://api-t1.fyers.in/api/v3/generate-authcode"
-FYERS_TOKEN_URL = "https://api-t1.fyers.in/api/v3/validate-authcode"
-FYERS_REDIRECT_URI = "https://127.0.0.1"
 TOKEN_OUTPUT_FILE = "new_token.txt"
-REQUEST_TIMEOUT = 30
 RESPONSE_TYPE = "code"
 GRANT_TYPE = "authorization_code"
 STATE = "fyers-token-generator"
@@ -31,18 +24,21 @@ STATE = "fyers-token-generator"
 class FyersCredentials:
     app_id: str
     secret_key: str
+    redirect_uri: str
 
 
 def read_credentials() -> FyersCredentials:
     """Read required FYERS credentials from environment variables."""
     app_id = os.getenv("FYERS_APP_ID", "").strip()
     secret_key = os.getenv("FYERS_SECRET_KEY", "").strip()
+    redirect_uri = os.getenv("FYERS_REDIRECT_URI", "").strip()
 
     missing = [
         name
         for name, value in (
             ("FYERS_APP_ID", app_id),
             ("FYERS_SECRET_KEY", secret_key),
+            ("FYERS_REDIRECT_URI", redirect_uri),
         )
         if not value
     ]
@@ -51,20 +47,30 @@ def read_credentials() -> FyersCredentials:
             "Missing required environment variable(s): " + ", ".join(missing)
         )
 
-    return FyersCredentials(app_id=app_id, secret_key=secret_key)
+    return FyersCredentials(
+        app_id=app_id,
+        secret_key=secret_key,
+        redirect_uri=redirect_uri,
+    )
+
+
+def build_session(credentials: FyersCredentials) -> Any:
+    """Create the official FYERS API v3 SessionModel instance."""
+    from fyers_apiv3 import fyersModel
+
+    return fyersModel.SessionModel(
+        client_id=credentials.app_id,
+        secret_key=credentials.secret_key,
+        redirect_uri=credentials.redirect_uri,
+        response_type=RESPONSE_TYPE,
+        grant_type=GRANT_TYPE,
+        state=STATE,
+    )
 
 
 def build_login_url(credentials: FyersCredentials) -> str:
-    """Build the FYERS authorization URL without exposing the app secret."""
-    query = urlencode(
-        {
-            "client_id": credentials.app_id,
-            "redirect_uri": FYERS_REDIRECT_URI,
-            "response_type": RESPONSE_TYPE,
-            "state": STATE,
-        }
-    )
-    return f"{FYERS_AUTH_URL}?{query}"
+    """Build the FYERS authorization URL with the official SDK."""
+    return str(build_session(credentials).generate_authcode())
 
 
 def extract_auth_code(redirected_url: str) -> str:
@@ -80,32 +86,18 @@ def extract_auth_code(redirected_url: str) -> str:
     return auth_code
 
 
-def app_id_hash(credentials: FyersCredentials) -> str:
-    """Return FYERS v3 SHA-256 appIdHash for client_id:secret_key."""
-    return hashlib.sha256(
-        f"{credentials.app_id}:{credentials.secret_key}".encode("utf-8")
-    ).hexdigest()
-
-
 def exchange_auth_code(credentials: FyersCredentials, auth_code: str) -> str:
-    """Exchange the auth code for an access token using FYERS API v3."""
-    payload = {
-        "grant_type": GRANT_TYPE,
-        "appIdHash": app_id_hash(credentials),
-        "code": auth_code,
-    }
-    response = requests.post(FYERS_TOKEN_URL, json=payload, timeout=REQUEST_TIMEOUT)
-    if not response.ok:
-        raise RuntimeError(
-            f"FYERS validate-authcode failed with HTTP {response.status_code}. "
-            f"Response body: {response.text}"
-        )
+    """Exchange the auth code for an access token using the official SDK."""
+    session = build_session(credentials)
+    session.set_token(auth_code)
+    response = session.generate_token()
 
-    data: dict[str, Any] = response.json()
+    if not isinstance(response, dict):
+        raise RuntimeError(f"FYERS returned an unexpected token response: {response!r}")
 
-    access_token = str(data.get("access_token") or "").strip()
+    access_token = str(response.get("access_token") or "").strip()
     if not access_token:
-        message = str(data.get("message") or data.get("s") or "unknown FYERS response")
+        message = str(response.get("message") or response.get("s") or response)
         raise RuntimeError(f"FYERS did not return an access token: {message}")
     return access_token
 
@@ -113,6 +105,13 @@ def exchange_auth_code(credentials: FyersCredentials, auth_code: str) -> str:
 def read_redirected_url() -> str:
     """Read the FYERS redirected URL from the environment when provided."""
     return os.getenv("FYERS_REDIRECTED_URL", "").strip()
+
+
+def write_token(access_token: str, output_file: str | None = None) -> None:
+    """Persist the generated access token to disk for GitHub Secret setup."""
+    output_file = output_file or TOKEN_OUTPUT_FILE
+    with open(output_file, "w", encoding="utf-8") as token_file:
+        token_file.write(access_token)
 
 
 def main() -> int:
@@ -125,11 +124,10 @@ def main() -> int:
 
         auth_code = extract_auth_code(redirected_url)
         access_token = exchange_auth_code(credentials, auth_code)
-        with open(TOKEN_OUTPUT_FILE, "w", encoding="utf-8") as token_file:
-            token_file.write(access_token)
+        write_token(access_token)
         print(f"Access token saved to {TOKEN_OUTPUT_FILE}")
         return 0
-    except (RuntimeError, ValueError, requests.RequestException) as error:
+    except (RuntimeError, ValueError, ImportError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
 

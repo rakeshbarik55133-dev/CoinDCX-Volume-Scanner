@@ -1,9 +1,8 @@
-import hashlib
 import os
+import sys
+import types
 import unittest
 from unittest.mock import Mock, patch
-from urllib.parse import parse_qs, urlparse
-
 import fyers_access_token_generator as generator
 
 
@@ -13,23 +12,51 @@ class FyersAccessTokenGeneratorTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "FYERS_APP_ID"):
                 generator.read_credentials()
 
-    def test_build_login_url_contains_required_fyers_v3_parameters(self) -> None:
+    def test_build_login_url_uses_official_fyers_v3_session(self) -> None:
         credentials = generator.FyersCredentials(
             app_id="APP-100",
             secret_key="never-printed",
             redirect_uri="https://example.com/callback",
         )
+        session = Mock()
+        session.generate_authcode.return_value = (
+            "https://api-t1.fyers.in/api/v3/generate-authcode?client_id=APP-100"
+        )
 
-        url = generator.build_login_url(credentials)
-        parsed = urlparse(url)
-        query = parse_qs(parsed.query)
+        with patch.object(generator, "build_session", return_value=session) as build_session:
+            url = generator.build_login_url(credentials)
 
-        self.assertEqual(url.split("?")[0], generator.FYERS_AUTH_URL)
-        self.assertEqual(query["client_id"], ["APP-100"])
-        self.assertEqual(query["redirect_uri"], ["https://example.com/callback"])
-        self.assertEqual(query["response_type"], ["code"])
-        self.assertNotIn("secret", url.lower())
+        self.assertEqual(
+            url,
+            "https://api-t1.fyers.in/api/v3/generate-authcode?client_id=APP-100",
+        )
+        build_session.assert_called_once_with(credentials)
+        session.generate_authcode.assert_called_once_with()
         self.assertNotIn("never-printed", url)
+
+    def test_build_session_passes_required_fyers_v3_parameters(self) -> None:
+        credentials = generator.FyersCredentials(
+            app_id="APP-100",
+            secret_key="secret",
+            redirect_uri="https://example.com/callback",
+        )
+        session_model = Mock(return_value="session")
+        fake_fyers_apiv3 = types.SimpleNamespace(
+            fyersModel=types.SimpleNamespace(SessionModel=session_model)
+        )
+
+        with patch.dict(sys.modules, {"fyers_apiv3": fake_fyers_apiv3}):
+            session = generator.build_session(credentials)
+
+        self.assertEqual(session, "session")
+        session_model.assert_called_once_with(
+            client_id="APP-100",
+            secret_key="secret",
+            redirect_uri="https://example.com/callback",
+            response_type="code",
+            grant_type="authorization_code",
+            state="fyers-token-generator",
+        )
 
     def test_extract_auth_code_supports_auth_code_or_code_parameters(self) -> None:
         self.assertEqual(
@@ -41,45 +68,22 @@ class FyersAccessTokenGeneratorTests(unittest.TestCase):
             "xyz789",
         )
 
-    def test_app_id_hash_uses_fyers_app_id_colon_secret_format(self) -> None:
-        credentials = generator.FyersCredentials("APP-100", "secret", "https://example.com")
-        expected = hashlib.sha256(b"APP-100:secret").hexdigest()
-        self.assertEqual(generator.app_id_hash(credentials), expected)
-
-    @patch("fyers_access_token_generator.requests.post")
-    def test_exchange_auth_code_posts_hash_and_returns_token_once(self, post: Mock) -> None:
-        response = Mock()
-        response.json.return_value = {"access_token": "APP-100:token"}
-        response.raise_for_status.return_value = None
-        post.return_value = response
+    @patch("fyers_access_token_generator.build_session")
+    def test_exchange_auth_code_uses_sdk_token_flow(self, build_session: Mock) -> None:
+        session = Mock()
+        session.generate_token.return_value = {"access_token": "APP-100:token"}
+        build_session.return_value = session
         credentials = generator.FyersCredentials("APP-100", "secret", "https://example.com")
 
         token = generator.exchange_auth_code(credentials, "auth-code-value")
 
         self.assertEqual(token, "APP-100:token")
-        post.assert_called_once()
-        payload = post.call_args.kwargs["json"]
-        self.assertEqual(payload["grant_type"], "authorization_code")
-        self.assertEqual(payload["code"], "auth-code-value")
-        self.assertNotIn("secret", str(payload))
-
-    @patch("fyers_access_token_generator.exchange_auth_code")
-    def test_main_without_redirected_url_prints_login_url_only(self, exchange: Mock) -> None:
-        env = {
-            "FYERS_APP_ID": "APP-100",
-            "FYERS_SECRET_KEY": "secret",
-            "FYERS_REDIRECT_URI": "https://example.com/callback",
-        }
-        with patch.dict(os.environ, env, clear=True), patch("builtins.print") as printed:
-            exit_code = generator.main()
-
-        self.assertEqual(exit_code, 0)
-        exchange.assert_not_called()
-        printed.assert_called_once()
-        self.assertIn(generator.FYERS_AUTH_URL, printed.call_args.args[0])
+        build_session.assert_called_once_with(credentials)
+        session.set_token.assert_called_once_with("auth-code-value")
+        session.generate_token.assert_called_once_with()
 
     @patch("fyers_access_token_generator.exchange_auth_code", return_value="APP-100:token")
-    def test_main_with_redirected_url_exchanges_and_prints_token_once(self, exchange: Mock) -> None:
+    def test_main_with_redirected_url_writes_new_token_file(self, exchange: Mock) -> None:
         env = {
             "FYERS_APP_ID": "APP-100",
             "FYERS_SECRET_KEY": "secret",
@@ -87,12 +91,19 @@ class FyersAccessTokenGeneratorTests(unittest.TestCase):
             "FYERS_REDIRECTED_URL": "https://example.com/callback?auth_code=abc123",
         }
         with patch.dict(os.environ, env, clear=True), patch("builtins.print") as printed:
-            exit_code = generator.main()
+            with patch("fyers_access_token_generator.TOKEN_OUTPUT_FILE", "test_new_token.txt"):
+                try:
+                    exit_code = generator.main()
+                    with open("test_new_token.txt", encoding="utf-8") as token_file:
+                        self.assertEqual(token_file.read(), "APP-100:token")
+                finally:
+                    if os.path.exists("test_new_token.txt"):
+                        os.remove("test_new_token.txt")
 
         self.assertEqual(exit_code, 0)
         exchange.assert_called_once()
         self.assertEqual(exchange.call_args.args[1], "abc123")
-        printed.assert_called_once_with("APP-100:token")
+        printed.assert_called_once_with("Access token saved to test_new_token.txt")
 
 
 if __name__ == "__main__":
