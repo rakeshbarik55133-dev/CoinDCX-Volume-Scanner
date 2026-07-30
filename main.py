@@ -37,7 +37,8 @@ LOGGED_INVALID_CANDLE_PAIRS: set[str] = set()
 # filters are used.
 BASE_LOOKBACK = 50
 MIN_HISTORY = BASE_LOOKBACK
-MAX_BASE_RANGE_PCT = 0.018
+MIN_BASE_RANGE_PCT = 0.03
+MAX_BASE_RANGE_PCT = 0.07
 MAX_BASE_DRIFT_PCT = 0.008
 MAX_BASE_VOLUME_VARIATION_RATIO = 1.6
 TRIGGER_VOLUME_MULTIPLE = 3.0
@@ -289,7 +290,10 @@ def find_latest_sideways_base(pair: str, candles: list[Candle]) -> BaseSetup | N
     base_high = max(candle.high for candle in base)
     base_low = min(candle.low for candle in base)
     base_mid = (base_high + base_low) / 2
-    if base_mid <= 0 or (base_high - base_low) / base_mid > MAX_BASE_RANGE_PCT:
+    if base_mid <= 0:
+        return None
+    base_range_pct = (base_high - base_low) / base_mid
+    if not (MIN_BASE_RANGE_PCT <= base_range_pct <= MAX_BASE_RANGE_PCT):
         return None
     if abs(base[-1].close - base[0].open) / base_mid > MAX_BASE_DRIFT_PCT:
         return None
